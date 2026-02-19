@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, PlainTextResponse
 import re
+import uuid
 
 app = FastAPI()
 
@@ -18,7 +19,7 @@ async def qbwc_get():
     return PlainTextResponse("QB Connector Service Ready")
 
 # ── SOAP Helper ──────────────────────────────────────
-def soap_wrap(method: str, inner: str) -> str:
+def soap_envelope(method: str, inner: str) -> str:
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -37,18 +38,17 @@ def soap_wrap(method: str, inner: str) -> str:
 async def qbwc_handler(request: Request):
     body = await request.body()
     body_str = body.decode("utf-8")
-    print("📥 Received:", body_str[:500])
+    print("📥 Received:", body_str[:300])
 
     # ── serverVersion ─────────────────────────────
     if "serverVersion" in body_str:
         print("📌 serverVersion request")
-        xml = soap_wrap("serverVersion", "1.0")
+        xml = soap_envelope("serverVersion", "<serverVersionRet>1.0</serverVersionRet>")
 
     # ── clientVersion ─────────────────────────────
     elif "clientVersion" in body_str:
         print("📌 clientVersion request")
-        # Empty string = OK, proceed
-        xml = soap_wrap("clientVersion", "")
+        xml = soap_envelope("clientVersion", "<clientVersionRet></clientVersionRet>")
 
     # ── authenticate ──────────────────────────────
     elif "authenticate" in body_str:
@@ -61,20 +61,31 @@ async def qbwc_handler(request: Request):
 
         if u == QB_USERNAME and p == QB_PASSWORD:
             print("✅ Auth success")
-            # Empty string = use currently open company file
-            inner = "<string></string><string></string>"
-        else:
-            print("❌ Auth failed — wrong credentials")
-            inner = "<string>nvu</string><string></string>"
-
-        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+            session_ticket = str(uuid.uuid4())
+            xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
     <authenticateResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
       <authenticateResult>
-        {inner}
+        <string>{session_ticket}</string>
+        <string></string>
+      </authenticateResult>
+    </authenticateResponse>
+  </soap:Body>
+</soap:Envelope>"""
+        else:
+            print("❌ Auth failed — wrong credentials")
+            xml = """<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <authenticateResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+      <authenticateResult>
+        <string>nvu</string>
+        <string>nvu</string>
       </authenticateResult>
     </authenticateResponse>
   </soap:Body>
@@ -90,27 +101,66 @@ async def qbwc_handler(request: Request):
     <CompanyQueryRq requestID="1"/>
   </QBXMLMsgsRq>
 </QBXML>"""
-        xml = soap_wrap("sendRequestXML", qbxml)
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <sendRequestXMLResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+      <sendRequestXMLResult>{qbxml}</sendRequestXMLResult>
+    </sendRequestXMLResponse>
+  </soap:Body>
+</soap:Envelope>"""
 
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
-        print("📩 Received response from QB:")
-        # Extract and print the response data
-        response_data = re.search(r'<response>(.*?)</response>', body_str, re.DOTALL)
-        if response_data:
-            print(response_data.group(1))
-        print("✅ Sync complete!")
-        xml = soap_wrap("receiveResponseXML", "100")
+        print("📩 Received response from QB!")
+        # Extract hresult and message if any error
+        hresult = re.search(r'<hresult>(.*?)</hresult>', body_str)
+        message = re.search(r'<message>(.*?)</message>', body_str)
+        if hresult:
+            print(f"⚠️ QB Error: {hresult.group(1)} - {message.group(1) if message else ''}")
+        else:
+            print("✅ QB processed request successfully!")
+            print("📊 Response data:", body_str[300:800])
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+      <receiveResponseXMLResult>100</receiveResponseXMLResult>
+    </receiveResponseXMLResponse>
+  </soap:Body>
+</soap:Envelope>"""
 
     # ── getLastError ──────────────────────────────
     elif "getLastError" in body_str:
-        print("⚠️ QB requested last error")
-        xml = soap_wrap("getLastError", "")
+        print("⚠️ getLastError called")
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <getLastErrorResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+      <getLastErrorResult></getLastErrorResult>
+    </getLastErrorResponse>
+  </soap:Body>
+</soap:Envelope>"""
 
     # ── closeConnection ───────────────────────────
     elif "closeConnection" in body_str:
         print("🔒 Session closed")
-        xml = soap_wrap("closeConnection", "OK")
+        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <closeConnectionResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+      <closeConnectionResult>OK</closeConnectionResult>
+    </closeConnectionResponse>
+  </soap:Body>
+</soap:Envelope>"""
 
     # ── unknown ───────────────────────────────────
     else:
