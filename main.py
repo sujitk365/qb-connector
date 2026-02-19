@@ -39,8 +39,19 @@ async def qbwc_handler(request: Request):
     body_str = body.decode("utf-8")
     print("📥 Received:", body_str[:500])
 
+    # ── serverVersion ─────────────────────────────
+    if "serverVersion" in body_str:
+        print("📌 serverVersion request")
+        xml = soap_wrap("serverVersion", "1.0")
+
+    # ── clientVersion ─────────────────────────────
+    elif "clientVersion" in body_str:
+        print("📌 clientVersion request")
+        # Empty string = OK, proceed
+        xml = soap_wrap("clientVersion", "")
+
     # ── authenticate ──────────────────────────────
-    if "authenticate" in body_str:
+    elif "authenticate" in body_str:
         username = re.search(r'<strUserName>(.*?)</strUserName>', body_str)
         password = re.search(r'<strPassword>(.*?)</strPassword>', body_str)
 
