@@ -109,9 +109,43 @@ async def qbwc_handler(request: Request):
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
         print("📩 Received inventory data from QB!")
-        # Print full response to see inventory items
-        print("📊 FULL RESPONSE:")
-        print(body_str)
+        
+        # Extract the response parameter
+        response_match = re.search(
+            r'<strHCPResponse>(.*?)</strHCPResponse>', 
+            body_str, re.DOTALL
+        )
+        if not response_match:
+            response_match = re.search(
+                r'<response>(.*?)</response>', 
+                body_str, re.DOTALL
+            )
+        
+        if response_match:
+            import html
+            raw = html.unescape(response_match.group(1))
+            print("📊 Decoded XML:")
+            print(raw)
+            
+            # Parse inventory items
+            items = re.findall(
+                r'<ItemInventoryRet>(.*?)</ItemInventoryRet>', 
+                raw, re.DOTALL
+            )
+            print(f"✅ Found {len(items)} inventory items")
+            
+            for item in items:
+                list_id = re.search(r'<ListID>(.*?)</ListID>', item)
+                name = re.search(r'<FullName>(.*?)</FullName>', item)
+                price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
+                cost = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
+                qty = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
+                
+                print(f"📦 Item: {name.group(1) if name else 'N/A'} | "
+                    f"Price: {price.group(1) if price else 'N/A'} | "
+                    f"Cost: {cost.group(1) if cost else 'N/A'} | "
+                    f"Qty: {qty.group(1) if qty else 'N/A'}")
+        
         xml = """<?xml version="1.0" encoding="utf-8"?>
     <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
