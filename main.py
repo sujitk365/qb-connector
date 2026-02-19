@@ -25,7 +25,7 @@ def soap_envelope(method: str, inner: str) -> str:
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <{method}Response xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <{method}Response xmlns="http://developer.intuit.com/">
       <{method}Result>
         {inner}
       </{method}Result>
@@ -67,7 +67,7 @@ async def qbwc_handler(request: Request):
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <authenticateResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <authenticateResponse xmlns="http://developer.intuit.com/">
       <authenticateResult>
         <string>{session_ticket}</string>
         <string></string>
@@ -82,7 +82,7 @@ async def qbwc_handler(request: Request):
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <authenticateResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <authenticateResponse xmlns="http://developer.intuit.com/">
       <authenticateResult>
         <string>nvu</string>
         <string>nvu</string>
@@ -94,19 +94,13 @@ async def qbwc_handler(request: Request):
     # ── sendRequestXML ────────────────────────────
     elif "sendRequestXML" in body_str:
         print("📤 Sending CompanyQuery to QB")
-        qbxml = """<?xml version="1.0" ?>
-<?qbxml version="13.0"?>
-<QBXML>
-  <QBXMLMsgsRq onError="stopOnError">
-    <CompanyQueryRq requestID="1"/>
-  </QBXMLMsgsRq>
-</QBXML>"""
+        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CompanyQueryRq requestID="1"/></QBXMLMsgsRq></QBXML>"""
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <sendRequestXMLResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <sendRequestXMLResponse xmlns="http://developer.intuit.com/">
       <sendRequestXMLResult>{qbxml}</sendRequestXMLResult>
     </sendRequestXMLResponse>
   </soap:Body>
@@ -115,7 +109,6 @@ async def qbwc_handler(request: Request):
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
         print("📩 Received response from QB!")
-        # Extract hresult and message if any error
         hresult = re.search(r'<hresult>(.*?)</hresult>', body_str)
         message = re.search(r'<message>(.*?)</message>', body_str)
         if hresult:
@@ -123,12 +116,12 @@ async def qbwc_handler(request: Request):
         else:
             print("✅ QB processed request successfully!")
             print("📊 Response data:", body_str[300:800])
-        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+        xml = """<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
       <receiveResponseXMLResult>100</receiveResponseXMLResult>
     </receiveResponseXMLResponse>
   </soap:Body>
@@ -137,12 +130,12 @@ async def qbwc_handler(request: Request):
     # ── getLastError ──────────────────────────────
     elif "getLastError" in body_str:
         print("⚠️ getLastError called")
-        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+        xml = """<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <getLastErrorResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <getLastErrorResponse xmlns="http://developer.intuit.com/">
       <getLastErrorResult></getLastErrorResult>
     </getLastErrorResponse>
   </soap:Body>
@@ -151,12 +144,12 @@ async def qbwc_handler(request: Request):
     # ── closeConnection ───────────────────────────
     elif "closeConnection" in body_str:
         print("🔒 Session closed")
-        xml = f"""<?xml version="1.0" encoding="utf-8"?>
+        xml = """<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
-    <closeConnectionResponse xmlns="http://developer.intuit.com/qbxml/qbwebconnector">
+    <closeConnectionResponse xmlns="http://developer.intuit.com/">
       <closeConnectionResult>OK</closeConnectionResult>
     </closeConnectionResponse>
   </soap:Body>
