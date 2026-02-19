@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, PlainTextResponse
 import re
 import uuid
+import html
 
 app = FastAPI()
 
@@ -93,8 +94,8 @@ async def qbwc_handler(request: Request):
 
     # ── sendRequestXML ────────────────────────────
     elif "sendRequestXML" in body_str:
-        print("📤 Sending CompanyQuery to QB")
-        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="1"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq></QBXMLMsgsRq></QBXML>"""
+        print("📤 Sending SalesOrder to QB")
+        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><SalesOrderAddRq requestID="1"><SalesOrderAdd><CustomerRef><FullName>Abercrombie, Kristy</FullName></CustomerRef><TxnDate>2026-02-19</TxnDate><PONumber>K365-TEST-001</PONumber><SalesOrderLineAdd><ItemRef><FullName>Wood Door:Exterior 1122</FullName></ItemRef><Quantity>2</Quantity><Rate>120.00</Rate></SalesOrderLineAdd></SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"""
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -108,54 +109,58 @@ async def qbwc_handler(request: Request):
 
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
-        print("📩 Received inventory data from QB!")
-        
-        # Extract the response parameter
+        print("📩 Received response from QB!")
+
         response_match = re.search(
-            r'<strHCPResponse>(.*?)</strHCPResponse>', 
+            r'<strHCPResponse>(.*?)</strHCPResponse>',
             body_str, re.DOTALL
         )
         if not response_match:
             response_match = re.search(
-                r'<response>(.*?)</response>', 
+                r'<response>(.*?)</response>',
                 body_str, re.DOTALL
             )
-        
+
         if response_match:
-            import html
             raw = html.unescape(response_match.group(1))
-            print("📊 Decoded XML:")
-            print(raw)
-            
-            # Parse inventory items
-            items = re.findall(
-                r'<ItemInventoryRet>(.*?)</ItemInventoryRet>', 
-                raw, re.DOTALL
-            )
-            print(f"✅ Found {len(items)} inventory items")
-            
-            for item in items:
-                list_id = re.search(r'<ListID>(.*?)</ListID>', item)
-                name = re.search(r'<FullName>(.*?)</FullName>', item)
-                price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
-                cost = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
-                qty = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
-                
-                print(f"📦 Item: {name.group(1) if name else 'N/A'} | "
-                    f"Price: {price.group(1) if price else 'N/A'} | "
-                    f"Cost: {cost.group(1) if cost else 'N/A'} | "
-                    f"Qty: {qty.group(1) if qty else 'N/A'}")
-        
+
+            # Check status
+            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw)
+            status_msg = re.search(r'<statusMessage>(.*?)</statusMessage>', raw)
+            status_sev = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw)
+
+            if status_code:
+                print(f"📋 Status: {status_code.group(1)} | "
+                      f"Severity: {status_sev.group(1) if status_sev else 'N/A'} | "
+                      f"Message: {status_msg.group(1) if status_msg else 'N/A'}")
+
+            # Extract SalesOrder details
+            txn_id = re.search(r'<TxnID>(.*?)</TxnID>', raw)
+            ref_num = re.search(r'<RefNumber>(.*?)</RefNumber>', raw)
+            customer = re.search(r'<FullName>(.*?)</FullName>', raw)
+
+            if txn_id:
+                print(f"✅ SalesOrder created in QB!")
+                print(f"🎫 TxnID: {txn_id.group(1)}")
+                print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
+                print(f"👤 Customer: {customer.group(1) if customer else 'N/A'}")
+            else:
+                print("⚠️ No TxnID found — possible error")
+                print("📊 Raw response:", raw[:500])
+        else:
+            print("⚠️ Could not extract response body")
+            print("📊 Full body:", body_str[300:800])
+
         xml = """<?xml version="1.0" encoding="utf-8"?>
-    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-    <soap:Body>
-        <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
-        <receiveResponseXMLResult>100</receiveResponseXMLResult>
-        </receiveResponseXMLResponse>
-    </soap:Body>
-    </soap:Envelope>"""
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <soap:Body>
+    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
+      <receiveResponseXMLResult>100</receiveResponseXMLResult>
+    </receiveResponseXMLResponse>
+  </soap:Body>
+</soap:Envelope>"""
 
     # ── getLastError ──────────────────────────────
     elif "getLastError" in body_str:
