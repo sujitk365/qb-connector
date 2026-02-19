@@ -1,7 +1,16 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, PlainTextResponse
 
 app = FastAPI()
+
+# THIS IS THE KEY FIX — QBWC does a GET first to verify the endpoint
+@app.get("/qbwc")
+async def qbwc_get():
+    return PlainTextResponse("QuickBooks Web Connector Service")
+
+@app.get("/")
+async def root():
+    return PlainTextResponse("QB Connector Running")
 
 SOAP_RESPONSE = """<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
@@ -18,13 +27,9 @@ async def qbwc_handler(request: Request):
     body_str = body.decode("utf-8")
     print("📥 Received:", body_str[:200])
 
-    # Detect which method QBWC is calling
     if "authenticate" in body_str:
-        # Return empty string = authenticated, use current company file
         xml = SOAP_RESPONSE.format(method="authenticate", result="<string></string><string></string>")
-    
     elif "sendRequestXML" in body_str:
-        # Send a simple query to QB — fetch company info
         qbxml = """<?xml version="1.0" ?>
 <?qbxml version="13.0"?>
 <QBXML>
@@ -33,18 +38,13 @@ async def qbwc_handler(request: Request):
   </QBXMLMsgsRq>
 </QBXML>"""
         xml = SOAP_RESPONSE.format(method="sendRequestXML", result=qbxml)
-
     elif "receiveResponseXML" in body_str:
-        # Tell QBWC we're done (100 = complete)
         xml = SOAP_RESPONSE.format(method="receiveResponseXML", result="100")
         print("✅ Got response from QB!")
-
     elif "closeConnection" in body_str:
         xml = SOAP_RESPONSE.format(method="closeConnection", result="OK")
-
     elif "getLastError" in body_str:
         xml = SOAP_RESPONSE.format(method="getLastError", result="")
-
     else:
         xml = "<soap:Envelope/>"
 
