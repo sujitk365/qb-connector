@@ -93,8 +93,8 @@ async def qbwc_handler(request: Request):
 
     # ── sendRequestXML ────────────────────────────
     elif "sendRequestXML" in body_str:
-        print("📤 Sending CompanyQuery to QB")
-        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CompanyQueryRq requestID="1"/></QBXMLMsgsRq></QBXML>"""
+        print("📤 Sending ItemInventory query to QB")
+        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="1"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq></QBXMLMsgsRq></QBXML>"""
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -108,24 +108,20 @@ async def qbwc_handler(request: Request):
 
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
-        print("📩 Received response from QB!")
-        hresult = re.search(r'<hresult>(.*?)</hresult>', body_str)
-        message = re.search(r'<message>(.*?)</message>', body_str)
-        if hresult:
-            print(f"⚠️ QB Error: {hresult.group(1)} - {message.group(1) if message else ''}")
-        else:
-            print("✅ QB processed request successfully!")
-            print("📊 Response data:", body_str[300:800])
+        print("📩 Received inventory data from QB!")
+        # Print full response to see inventory items
+        print("📊 FULL RESPONSE:")
+        print(body_str)
         xml = """<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <soap:Body>
-    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
-      <receiveResponseXMLResult>100</receiveResponseXMLResult>
-    </receiveResponseXMLResponse>
-  </soap:Body>
-</soap:Envelope>"""
+    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+    <soap:Body>
+        <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
+        <receiveResponseXMLResult>100</receiveResponseXMLResult>
+        </receiveResponseXMLResponse>
+    </soap:Body>
+    </soap:Envelope>"""
 
     # ── getLastError ──────────────────────────────
     elif "getLastError" in body_str:
