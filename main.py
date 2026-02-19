@@ -94,18 +94,18 @@ async def qbwc_handler(request: Request):
 
     # ── sendRequestXML ────────────────────────────
     elif "sendRequestXML" in body_str:
-        print("📤 Sending SalesOrder to QB")
-        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><SalesOrderAddRq requestID="1"><SalesOrderAdd><CustomerRef><FullName>Abercrombie, Kristy</FullName></CustomerRef><TxnDate>2026-02-19</TxnDate><PONumber>K365-TEST-001</PONumber><SalesOrderLineAdd><ItemRef><FullName>Wood Door:Exterior 1122</FullName></ItemRef><Quantity>2</Quantity><Rate>120.00</Rate></SalesOrderLineAdd></SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"""
+        print("📤 Sending CustomerAdd to QB")
+        qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="1"><CustomerAdd><Name>Kitchen365 Test Customer</Name><CompanyName>Kitchen365 Test Co</CompanyName><FirstName>John</FirstName><LastName>Smith</LastName><BillAddress><Addr1>123 Test Street</Addr1><City>Ahmedabad</City><State>GJ</State><PostalCode>380001</PostalCode><Country>India</Country></BillAddress><Phone>9876543210</Phone><Email>john.smith@kitchen365test.com</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <soap:Body>
-    <sendRequestXMLResponse xmlns="http://developer.intuit.com/">
-      <sendRequestXMLResult><![CDATA[{qbxml}]]></sendRequestXMLResult>
-    </sendRequestXMLResponse>
-  </soap:Body>
-</soap:Envelope>"""
+    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+    <soap:Body>
+        <sendRequestXMLResponse xmlns="http://developer.intuit.com/">
+        <sendRequestXMLResult><![CDATA[{qbxml}]]></sendRequestXMLResult>
+        </sendRequestXMLResponse>
+    </soap:Body>
+    </soap:Envelope>"""
 
     # ── receiveResponseXML ────────────────────────
     elif "receiveResponseXML" in body_str:
@@ -131,36 +131,33 @@ async def qbwc_handler(request: Request):
 
             if status_code:
                 print(f"📋 Status: {status_code.group(1)} | "
-                      f"Severity: {status_sev.group(1) if status_sev else 'N/A'} | "
-                      f"Message: {status_msg.group(1) if status_msg else 'N/A'}")
+                    f"Severity: {status_sev.group(1) if status_sev else 'N/A'} | "
+                    f"Message: {status_msg.group(1) if status_msg else 'N/A'}")
 
-            # Extract SalesOrder details
-            txn_id = re.search(r'<TxnID>(.*?)</TxnID>', raw)
-            ref_num = re.search(r'<RefNumber>(.*?)</RefNumber>', raw)
-            customer = re.search(r'<FullName>(.*?)</FullName>', raw)
+            # Check if CustomerAdd response
+            list_id = re.search(r'<ListID>(.*?)</ListID>', raw)
+            name = re.search(r'<FullName>(.*?)</FullName>', raw)
+            email = re.search(r'<Email>(.*?)</Email>', raw)
 
-            if txn_id:
-                print(f"✅ SalesOrder created in QB!")
-                print(f"🎫 TxnID: {txn_id.group(1)}")
-                print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
-                print(f"👤 Customer: {customer.group(1) if customer else 'N/A'}")
+            if list_id:
+                print(f"✅ Customer created in QB!")
+                print(f"🎫 ListID: {list_id.group(1)}")
+                print(f"👤 Name: {name.group(1) if name else 'N/A'}")
+                print(f"📧 Email: {email.group(1) if email else 'N/A'}")
             else:
-                print("⚠️ No TxnID found — possible error")
-                print("📊 Raw response:", raw[:500])
-        else:
-            print("⚠️ Could not extract response body")
-            print("📊 Full body:", body_str[300:800])
+                print("⚠️ No ListID found — possible error")
+                print("📊 Raw:", raw[:500])
 
         xml = """<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-               xmlns:xsd="http://www.w3.org/2001/XMLSchema">
-  <soap:Body>
-    <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
-      <receiveResponseXMLResult>100</receiveResponseXMLResult>
-    </receiveResponseXMLResponse>
-  </soap:Body>
-</soap:Envelope>"""
+    <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+    <soap:Body>
+        <receiveResponseXMLResponse xmlns="http://developer.intuit.com/">
+        <receiveResponseXMLResult>100</receiveResponseXMLResult>
+        </receiveResponseXMLResponse>
+    </soap:Body>
+    </soap:Envelope>"""
 
     # ── getLastError ──────────────────────────────
     elif "getLastError" in body_str:
