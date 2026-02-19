@@ -93,7 +93,7 @@ async def qbwc_handler(request: Request):
 
     # ── sendRequestXML ────────────────────────────
     elif "sendRequestXML" in body_str:
-        print("📤 Sending ItemInventory query to QB")
+        print("📤 Sending CompanyQuery to QB")
         qbxml = """<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="1"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq></QBXMLMsgsRq></QBXML>"""
         xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -101,7 +101,7 @@ async def qbwc_handler(request: Request):
                xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <soap:Body>
     <sendRequestXMLResponse xmlns="http://developer.intuit.com/">
-      <sendRequestXMLResult>{qbxml}</sendRequestXMLResult>
+      <sendRequestXMLResult><![CDATA[{qbxml}]]></sendRequestXMLResult>
     </sendRequestXMLResponse>
   </soap:Body>
 </soap:Envelope>"""
