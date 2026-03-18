@@ -1,16 +1,21 @@
-from fastapi import FastAPI, Request
+import os
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import Response, PlainTextResponse
 import re
 import uuid
 import html
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Any
 
 app = FastAPI()
 
 # ── Config ──────────────────────────────────────────────────────────────────
-QB_USERNAME = "qbuser"
-QB_PASSWORD = "admin123"
+QB_USERNAME = os.environ.get("QB_USERNAME", "qbuser")
+QB_PASSWORD = os.environ.get("QB_PASSWORD", "admin123")
+
+# Magento OMS (when qb-connector calls Magento REST)
+OMS_BASE_URL = os.environ.get("OMS_BASE_URL", "https://oms.kitchen365test.com")
+OMS_BEARER_TOKEN = os.environ.get("OMS_BEARER_TOKEN", "tqe1crbqwqdqlxocd9j07d1x2etbat08")
 
 # ── In-Memory Store (replace with MySQL in production) ───────────────────────
 #
@@ -239,6 +244,11 @@ def receive_response(progress: int) -> str:
   </soap:Body>
 </soap:Envelope>"""
 
+
+# ── Customer push REST API (separate file) ────────────────────────────────────
+from customer_push import get_customer_router
+
+app.include_router(get_customer_router(job_queue, transaction_map))
 
 # ── Status endpoint (simple dashboard) ──────────────────────────────────────
 @app.get("/status")
