@@ -8,6 +8,9 @@ import logging
 import requests
 from datetime import datetime
 from typing import Optional, Tuple
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -20,12 +23,12 @@ logger.setLevel(_level)
 LOG_PREFIX = "[OMS_SYNC]"
 
 # ── Config ──────────────────────────────────────────────────────────────────
-QB_USERNAME = "qbuser"
-QB_PASSWORD = "admin123"
-OMS_BASE_URL = os.environ.get("OMS_BASE_URL", "https://oms.kitchen365test.com").rstrip("/")
-OMS_ACCESS_TOKEN = os.environ.get("OMS_ACCESS_TOKEN", "tqe1crbqwqdqlxocd9j07d1x2etbat08")
-OMS_PAGE_SIZE = 100
-OMS_REQUEST_TIMEOUT = 30
+QB_USERNAME = os.environ.get("QB_USERNAME", "qbuser")
+QB_PASSWORD = os.environ.get("QB_PASSWORD", "admin123")
+OMS_BASE_URL = (os.environ.get("OMS_BASE_URL") or "https://oms.kitchen365test.com").rstrip("/")
+OMS_ACCESS_TOKEN = (os.environ.get("OMS_ACCESS_TOKEN") or "").strip()
+OMS_PAGE_SIZE = int(os.environ.get("OMS_PAGE_SIZE", "100"))
+OMS_REQUEST_TIMEOUT = int(os.environ.get("OMS_REQUEST_TIMEOUT", "30"))
 
 # ── In-Memory Store (replace with MySQL in production) ───────────────────────
 #
@@ -235,6 +238,8 @@ def fetch_all_oms_customers() -> list:
     all_items = []
     page = 1
     total_count = None
+    if not OMS_ACCESS_TOKEN:
+        logger.warning("%s [CUSTOMER_FETCH] OMS_ACCESS_TOKEN not set; request will likely get 401. Set env OMS_ACCESS_TOKEN to your Bearer token.", LOG_PREFIX)
     logger.info("%s [CUSTOMER_FETCH] Starting OMS customer fetch from %s", LOG_PREFIX, OMS_BASE_URL)
     while True:
         params = {
