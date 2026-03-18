@@ -248,7 +248,7 @@ def receive_response(progress: int) -> str:
 # ── Customer push REST API (separate file) ────────────────────────────────────
 from customer_push import get_customer_router
 
-app.include_router(get_customer_router(job_queue, transaction_map))
+app.include_router(get_customer_router(job_queue, transaction_map, OMS_BASE_URL, OMS_BEARER_TOKEN))
 
 # ── Status endpoint (simple dashboard) ──────────────────────────────────────
 @app.get("/status")
