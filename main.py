@@ -595,9 +595,9 @@ async def qbwc_handler(request: Request):
             status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw, re.IGNORECASE)
             status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw, re.IGNORECASE)
             status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw, re.IGNORECASE)
-            code = (status_code.group(1) or "0").strip()
-            sev  = (status_sev.group(1) or "Info").strip()
-            msg  = (status_msg.group(1) or "").strip()
+            code = (status_code.group(1) if status_code else "0").strip()
+            sev  = (status_sev.group(1) if status_sev else "Info").strip()
+            msg  = (status_msg.group(1) if status_msg else "").strip()
             print(f"📋 QB Status: {code} | {sev} | {msg}")
 
             # ── Handle by operation ───────────────────────────
