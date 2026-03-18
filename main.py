@@ -7,7 +7,7 @@ import os
 import logging
 import requests
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 app = FastAPI()
 
@@ -23,7 +23,7 @@ LOG_PREFIX = "[OMS_SYNC]"
 QB_USERNAME = "qbuser"
 QB_PASSWORD = "admin123"
 OMS_BASE_URL = os.environ.get("OMS_BASE_URL", "https://oms.kitchen365test.com").rstrip("/")
-OMS_ACCESS_TOKEN = os.environ.get("OMS_ACCESS_TOKEN", "")
+OMS_ACCESS_TOKEN = os.environ.get("OMS_ACCESS_TOKEN", "tqe1crbqwqdqlxocd9j07d1x2etbat08")
 OMS_PAGE_SIZE = 100
 OMS_REQUEST_TIMEOUT = 30
 
@@ -257,6 +257,8 @@ def fetch_all_oms_customers() -> list:
         if resp.status_code != 200:
             body_snippet = (resp.text or "")[:500]
             logger.error("%s [CUSTOMER_FETCH] HTTP %s from OMS (page=%s). Body: %s", LOG_PREFIX, resp.status_code, page, body_snippet)
+            if resp.status_code == 401:
+                logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN to an integration token with Magento_Customer::customer access.", LOG_PREFIX)
             break
         try:
             data = resp.json()
@@ -281,7 +283,7 @@ def fetch_all_oms_customers() -> list:
     return all_items
 
 
-def sync_oms_customers_to_queue(client_id: str) -> tuple[int, int]:
+def sync_oms_customers_to_queue(client_id: str) -> Tuple[int, int]:
     """
     Fetch all OMS customers, map to push_customer jobs, and append to job_queue for those not already
     in transaction_map or already pending in queue. Returns (added_count, skipped_count).
