@@ -609,36 +609,45 @@ async def qbwc_handler(request: Request):
             )
 
         if response_match and session:
-            raw = html.unescape(response_match.group(1))
+            raw = response_match.group(1).strip()
+            if raw.startswith("<![CDATA[") and raw.endswith("]]>"):
+                raw = raw[9:-3]
+            raw = html.unescape(raw)
             job = session["jobs"][session["index"]]
 
             # ── Check status ──────────────────────────────────
-            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw)
-            status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw)
-            status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw)
+            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw, re.IGNORECASE)
+            status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw, re.IGNORECASE)
+            status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw, re.IGNORECASE)
 
-            code = status_code.group(1) if status_code else "0"
-            sev  = status_sev.group(1) if status_sev else "Info"
-            msg  = status_msg.group(1) if status_msg else ""
+            code = status_code.group(1).strip() if status_code else "0"
+            sev  = status_sev.group(1).strip() if status_sev else "Info"
+            msg  = status_msg.group(1).strip() if status_msg else ""
             print(f"📋 QB Status: {code} | {sev} | {msg}")
 
             # ── Handle by operation ───────────────────────────
             if job["operation"] == "push_customer":
-                list_id = re.search(r'<ListID>(.*?)</ListID>', raw)
-                name    = re.search(r'<FullName>(.*?)</FullName>', raw)
+                list_id = re.search(r'<ListID>(.*?)</ListID>', raw, re.IGNORECASE | re.DOTALL)
+                if not list_id:
+                    list_id = re.search(r'<listID>(.*?)</listID>', raw, re.DOTALL)
+                name = re.search(r'<FullName>(.*?)</FullName>', raw, re.IGNORECASE)
 
                 if list_id:
-                    qb_list_id = list_id.group(1)
+                    qb_list_id = list_id.group(1).strip()
                     update_job(job["id"], status="completed", qb_id=qb_list_id)
                     transaction_map[f"customer:{job['k365_id']}"] = qb_list_id
                     print(f"✅ Customer created! ListID: {qb_list_id}")
                     print(f"👤 QB Name: {name.group(1) if name else 'N/A'}")
-                    # Unblock any orders waiting for this customer
                     resolve_dependencies(job["id"])
                 elif code == "3100":
-                    # Already exists — not a real error for us
                     print(f"⚠️ Customer already exists in QB — marking completed")
                     update_job(job["id"], status="completed")
+                elif code == "0" and sev and sev.lower() == "info":
+                    # QB returned success (0, Info) but we could not parse ListID — treat as completed
+                    update_job(job["id"], status="completed")
+                    transaction_map[f"customer:{job['k365_id']}"] = f"ok_{job['k365_id']}"
+                    print(f"✅ Customer add accepted (status 0); ListID not in response — marked completed")
+                    resolve_dependencies(job["id"])
                 else:
                     print(f"❌ Customer push failed: {msg}")
                     retry = job["retry_count"] + 1
