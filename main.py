@@ -27,6 +27,7 @@ QB_USERNAME = os.environ.get("QB_USERNAME", "qbuser")
 QB_PASSWORD = os.environ.get("QB_PASSWORD", "admin123")
 OMS_BASE_URL = (os.environ.get("OMS_BASE_URL") or "https://oms.kitchen365test.com").rstrip("/")
 OMS_ACCESS_TOKEN = (os.environ.get("OMS_ACCESS_TOKEN") or "").strip()
+OMS_PAGE_SIZE = int(os.environ.get("OMS_PAGE_SIZE", "100"))
 OMS_REQUEST_TIMEOUT = int(os.environ.get("OMS_REQUEST_TIMEOUT", "30"))
 
 # ── In-Memory Store (replace with MySQL in production) ───────────────────────
@@ -157,7 +158,7 @@ job_queue = [
 ]
 
 
-# ── OMS customer fetch and sync (all customers) ───────────────────────────────
+# ── OMS customer fetch and sync ──────────────────────────────────────────────
 
 def _oms_headers() -> dict:
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
@@ -166,14 +167,14 @@ def _oms_headers() -> dict:
     return headers
 
 
-def _magento_customer_to_payload(customer: dict) -> Optional[dict]:
-    """Map Magento customer to payload for build_customer_xml."""
+def magento_customer_to_payload(customer: dict) -> Optional[dict]:
+    """Map Magento customer object to payload expected by build_customer_xml."""
     try:
         first = (customer.get("firstname") or "").strip()
         last = (customer.get("lastname") or "").strip()
         email = (customer.get("email") or "").strip()
         if not email:
-            logger.error("%s [CUSTOMER_FETCH] Skipping customer missing email: id=%s", LOG_PREFIX, customer.get("id"))
+            logger.error("%s [CUSTOMER_FETCH] Skipping customer with missing email: id=%s", LOG_PREFIX, customer.get("id"))
             return None
         addresses = customer.get("addresses") or []
         default_billing = customer.get("default_billing")
@@ -185,7 +186,13 @@ def _magento_customer_to_payload(customer: dict) -> Optional[dict]:
                     break
         if not addr and addresses:
             addr = addresses[0] if isinstance(addresses[0], dict) else None
-        street, city, state, postal, country, company, phone = "", "", "", "", "", "", ""
+        street = ""
+        city = ""
+        state = ""
+        postal = ""
+        country = ""
+        company = ""
+        phone = ""
         if addr:
             street_list = addr.get("street")
             if isinstance(street_list, list):
@@ -199,99 +206,128 @@ def _magento_customer_to_payload(customer: dict) -> Optional[dict]:
             elif isinstance(region, str):
                 state = region.strip()
             postal = (addr.get("postcode") or "").strip()
-            country = (addr.get("country_id") or "").strip()
+            country_id = (addr.get("country_id") or "").strip()
+            country = country_id
             company = (addr.get("company") or "").strip()
             phone = (addr.get("telephone") or "").strip()
-        name = f"{first} {last}".strip() or email or f"Customer {customer.get('id')}"
-        name = f"Kitchen365 {name}"
+        name = f"{first} {last}".strip() or email
+        if not name:
+            name = email
+        name = f"Kitchen365 {name}" if name else f"Kitchen365 {email}"
         return {
-            "name": name, "company": company, "first_name": first, "last_name": last,
-            "email": email, "phone": phone, "addr1": street, "city": city,
-            "state": state, "postal": postal, "country": country,
+            "name": name,
+            "company": company,
+            "first_name": first,
+            "last_name": last,
+            "email": email,
+            "phone": phone,
+            "addr1": street,
+            "city": city,
+            "state": state,
+            "postal": postal,
+            "country": country,
         }
     except Exception as e:
-        logger.exception("%s [CUSTOMER_FETCH] Map customer failed id=%s: %s", LOG_PREFIX, customer.get("id"), e)
+        logger.exception("%s [CUSTOMER_FETCH] Failed to map customer id=%s: %s", LOG_PREFIX, customer.get("id"), e)
         return None
 
 
 def fetch_all_oms_customers() -> list:
-    """Fetch ALL customers from OMS: 2 sort params + pagination until total_count reached."""
+    """Fetch all customers from OMS. Sort params: field + direction; paginate with pageSize/currentPage to get all (e.g. 372)."""
     url_base = f"{OMS_BASE_URL}/rest/V1/customers/search"
     all_items = []
     page = 1
-    page_size = 100
     total_count = None
     if not OMS_ACCESS_TOKEN:
-        logger.warning("%s [CUSTOMER_FETCH] OMS_ACCESS_TOKEN not set; may get 401.", LOG_PREFIX)
-    logger.info("%s [CUSTOMER_FETCH] Starting fetch from %s", LOG_PREFIX, OMS_BASE_URL)
+        logger.warning("%s [CUSTOMER_FETCH] OMS_ACCESS_TOKEN not set; request will likely get 401. Set env OMS_ACCESS_TOKEN to your Bearer token.", LOG_PREFIX)
+    logger.info("%s [CUSTOMER_FETCH] Starting OMS customer fetch from %s", LOG_PREFIX, OMS_BASE_URL)
     while True:
         params = {
             "searchCriteria[sortOrders][0][field]": "created_at",
             "searchCriteria[sortOrders][0][direction]": "DESC",
-            "searchCriteria[pageSize]": page_size,
             "searchCriteria[currentPage]": page,
         }
         try:
-            resp = requests.get(url_base, params=params, headers=_oms_headers(), timeout=OMS_REQUEST_TIMEOUT)
+            resp = requests.get(
+                url_base,
+                params=params,
+                headers=_oms_headers(),
+                timeout=OMS_REQUEST_TIMEOUT,
+            )
+            logger.debug("%s [CUSTOMER_FETCH] Request URL: %s", LOG_PREFIX, resp.url)
         except requests.RequestException as e:
-            logger.error("%s [CUSTOMER_FETCH] HTTP request failed: %s", LOG_PREFIX, e)
+            logger.error("%s [CUSTOMER_FETCH] HTTP request failed (page=%s): %s", LOG_PREFIX, page, e)
             break
         if resp.status_code != 200:
-            logger.error("%s [CUSTOMER_FETCH] HTTP %s. Body: %s", LOG_PREFIX, resp.status_code, (resp.text or "")[:400])
+            body_snippet = (resp.text or "")[:500]
+            logger.error("%s [CUSTOMER_FETCH] HTTP %s from OMS (page=%s). Body: %s", LOG_PREFIX, resp.status_code, page, body_snippet)
             if resp.status_code == 401:
-                logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN.", LOG_PREFIX)
+                logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN to an integration token with Magento_Customer::customer access.", LOG_PREFIX)
             break
         try:
             data = resp.json()
         except ValueError as e:
-            logger.error("%s [CUSTOMER_FETCH] JSON error: %s", LOG_PREFIX, e)
+            logger.error("%s [CUSTOMER_FETCH] JSON decode error (page=%s): %s. Body snippet: %s", LOG_PREFIX, page, e, (resp.text or "")[:300])
             break
         items = data.get("items")
         if not isinstance(items, list):
-            logger.error("%s [CUSTOMER_FETCH] Invalid 'items'", LOG_PREFIX)
+            logger.error("%s [CUSTOMER_FETCH] Response missing or invalid 'items' (page=%s)", LOG_PREFIX, page)
             break
         if total_count is None and "total_count" in data:
             total_count = data.get("total_count")
             logger.info("%s [CUSTOMER_FETCH] total_count from API: %s", LOG_PREFIX, total_count)
-        logger.info("%s [CUSTOMER_FETCH] Fetched %s items (total so far: %s)", LOG_PREFIX, len(items), len(all_items) + len(items))
+        logger.info("%s [CUSTOMER_FETCH] Page %s: got %s items (total so far: %s)", LOG_PREFIX, page, len(items), len(all_items) + len(items))
         all_items.extend(items)
         if not items:
             break
         if total_count is not None and len(all_items) >= total_count:
             break
         page += 1
-    logger.info("%s [CUSTOMER_FETCH] Finished. Total fetched: %s", LOG_PREFIX, len(all_items))
+    logger.info("%s [CUSTOMER_FETCH] Finished OMS customer fetch. Total fetched: %s", LOG_PREFIX, len(all_items))
     return all_items
 
 
 def sync_oms_customers_to_queue(client_id: str) -> Tuple[int, int]:
-    """Fetch ALL OMS customers and add push_customer jobs for any not already synced. Returns (added, skipped)."""
-    raw = fetch_all_oms_customers()
-    existing_pending = {j["k365_id"] for j in job_queue if j.get("k365_id") and j["status"] == "pending"}
-    added, skipped = 0, 0
-    for customer in raw:
+    """
+    Fetch all OMS customers, map to push_customer jobs, and append to job_queue for those not already
+    in transaction_map or already pending in queue. Returns (added_count, skipped_count).
+    """
+    raw_customers = fetch_all_oms_customers()
+    existing_pending_k365 = {j["k365_id"] for j in job_queue if j.get("k365_id") and j["status"] == "pending"}
+    added = 0
+    skipped = 0
+    for customer in raw_customers:
         cid = customer.get("id")
         if cid is None:
+            logger.debug("%s [CUSTOMER_FETCH] Skipping customer with no id", LOG_PREFIX)
             skipped += 1
             continue
         k365_id = str(cid)
         if transaction_map.get(f"customer:{k365_id}"):
             skipped += 1
             continue
-        if k365_id in existing_pending:
+        if k365_id in existing_pending_k365:
             skipped += 1
             continue
-        payload = _magento_customer_to_payload(customer)
+        payload = magento_customer_to_payload(customer)
         if not payload:
             skipped += 1
             continue
         job_id = f"job_oms_{k365_id}"
         job_queue.append({
-            "id": job_id, "client_id": client_id, "operation": "push_customer", "priority": 3,
-            "source": "customer_flow", "status": "pending", "k365_id": k365_id, "linked_order": None,
-            "retry_count": 0, "qb_id": None, "payload": payload,
+            "id": job_id,
+            "client_id": client_id,
+            "operation": "push_customer",
+            "priority": 3,
+            "source": "customer_flow",
+            "status": "pending",
+            "k365_id": k365_id,
+            "linked_order": None,
+            "retry_count": 0,
+            "qb_id": None,
+            "payload": payload,
         })
-        existing_pending.add(k365_id)
+        existing_pending_k365.add(k365_id)
         added += 1
     logger.info("%s [CUSTOMER_FETCH] Sync complete: jobs added=%s, skipped=%s", LOG_PREFIX, added, skipped)
     return added, skipped
@@ -474,8 +510,8 @@ async def qbwc_handler(request: Request):
             except Exception as e:
                 logger.exception("%s [CUSTOMER_FETCH] Sync failed during authenticate: %s", LOG_PREFIX, e)
 
-            # Load next batch of jobs for this client (large batch so all customers can sync)
-            jobs = get_next_jobs_for_client(u, max_jobs=500)
+            # Load next batch of jobs for this client
+            jobs = get_next_jobs_for_client(u, max_jobs=5)
 
             if jobs:
                 sessions[ticket] = {
@@ -585,46 +621,36 @@ async def qbwc_handler(request: Request):
             )
 
         if response_match and session:
-            raw = response_match.group(1).strip()
-            if raw.startswith("<![CDATA[") and raw.endswith("]]>"):
-                raw = raw[9:-3]
-            raw = html.unescape(raw)
+            raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
 
             # ── Check status ──────────────────────────────────
-            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw, re.IGNORECASE)
-            status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw, re.IGNORECASE)
-            status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw, re.IGNORECASE)
-            code = (status_code.group(1) if status_code else "0").strip()
-            sev  = (status_sev.group(1) if status_sev else "Info").strip()
-            msg  = (status_msg.group(1) if status_msg else "").strip()
+            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw)
+            status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw)
+            status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw)
+
+            code = status_code.group(1) if status_code else "0"
+            sev  = status_sev.group(1) if status_sev else "Info"
+            msg  = status_msg.group(1) if status_msg else ""
             print(f"📋 QB Status: {code} | {sev} | {msg}")
 
             # ── Handle by operation ───────────────────────────
             if job["operation"] == "push_customer":
-                list_id = re.search(r'<ListID>(.*?)</ListID>', raw, re.IGNORECASE | re.DOTALL)
-                if not list_id:
-                    list_id = re.search(r'<listID>(.*?)</listID>', raw, re.DOTALL)
-                name = re.search(r'<FullName>(.*?)</FullName>', raw, re.IGNORECASE)
+                list_id = re.search(r'<ListID>(.*?)</ListID>', raw)
+                name    = re.search(r'<FullName>(.*?)</FullName>', raw)
 
                 if list_id:
-                    qb_list_id = list_id.group(1).strip()
+                    qb_list_id = list_id.group(1)
                     update_job(job["id"], status="completed", qb_id=qb_list_id)
                     transaction_map[f"customer:{job['k365_id']}"] = qb_list_id
                     print(f"✅ Customer created! ListID: {qb_list_id}")
-                    if name:
-                        print(f"👤 QB Name: {name.group(1)}")
+                    print(f"👤 QB Name: {name.group(1) if name else 'N/A'}")
+                    # Unblock any orders waiting for this customer
                     resolve_dependencies(job["id"])
                 elif code == "3100":
+                    # Already exists — not a real error for us
                     print(f"⚠️ Customer already exists in QB — marking completed")
                     update_job(job["id"], status="completed")
-                    resolve_dependencies(job["id"])
-                elif code == "0" and (not sev or sev.lower() == "info"):
-                    # QB returned success but ListID not in response — mark completed so all customers sync
-                    update_job(job["id"], status="completed")
-                    transaction_map[f"customer:{job['k365_id']}"] = f"ok_{job['k365_id']}"
-                    print(f"✅ Customer add accepted (status 0) — marked completed")
-                    resolve_dependencies(job["id"])
                 else:
                     print(f"❌ Customer push failed: {msg}")
                     retry = job["retry_count"] + 1
