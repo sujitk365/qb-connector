@@ -27,7 +27,6 @@ QB_USERNAME = os.environ.get("QB_USERNAME", "qbuser")
 QB_PASSWORD = os.environ.get("QB_PASSWORD", "admin123")
 OMS_BASE_URL = (os.environ.get("OMS_BASE_URL") or "https://oms.kitchen365test.com").rstrip("/")
 OMS_ACCESS_TOKEN = (os.environ.get("OMS_ACCESS_TOKEN") or "").strip()
-OMS_PAGE_SIZE = int(os.environ.get("OMS_PAGE_SIZE", "100"))
 OMS_REQUEST_TIMEOUT = int(os.environ.get("OMS_REQUEST_TIMEOUT", "30"))
 
 # ── In-Memory Store (replace with MySQL in production) ───────────────────────
@@ -233,59 +232,47 @@ def magento_customer_to_payload(customer: dict) -> Optional[dict]:
 
 
 def fetch_all_oms_customers() -> list:
-    """Fetch all customers from OMS. Sort params: field + direction; paginate with pageSize/currentPage to get all (e.g. 372)."""
+    """Fetch all customers from OMS. Only 2 params: sort field + direction (no pageSize/currentPage)."""
     url_base = f"{OMS_BASE_URL}/rest/V1/customers/search"
-    all_items = []
-    page = 1
-    total_count = None
     if not OMS_ACCESS_TOKEN:
         logger.warning("%s [CUSTOMER_FETCH] OMS_ACCESS_TOKEN not set; request will likely get 401. Set env OMS_ACCESS_TOKEN to your Bearer token.", LOG_PREFIX)
     logger.info("%s [CUSTOMER_FETCH] Starting OMS customer fetch from %s", LOG_PREFIX, OMS_BASE_URL)
-    while True:
-        params = {
-            "searchCriteria[sortOrders][0][field]": "created_at",
-            "searchCriteria[sortOrders][0][direction]": "DESC",
-            "searchCriteria[pageSize]": OMS_PAGE_SIZE,
-            "searchCriteria[currentPage]": page,
-        }
-        try:
-            resp = requests.get(
-                url_base,
-                params=params,
-                headers=_oms_headers(),
-                timeout=OMS_REQUEST_TIMEOUT,
-            )
-            logger.debug("%s [CUSTOMER_FETCH] Request URL: %s", LOG_PREFIX, resp.url)
-        except requests.RequestException as e:
-            logger.error("%s [CUSTOMER_FETCH] HTTP request failed (page=%s): %s", LOG_PREFIX, page, e)
-            break
-        if resp.status_code != 200:
-            body_snippet = (resp.text or "")[:500]
-            logger.error("%s [CUSTOMER_FETCH] HTTP %s from OMS (page=%s). Body: %s", LOG_PREFIX, resp.status_code, page, body_snippet)
-            if resp.status_code == 401:
-                logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN to an integration token with Magento_Customer::customer access.", LOG_PREFIX)
-            break
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error("%s [CUSTOMER_FETCH] JSON decode error (page=%s): %s. Body snippet: %s", LOG_PREFIX, page, e, (resp.text or "")[:300])
-            break
-        items = data.get("items")
-        if not isinstance(items, list):
-            logger.error("%s [CUSTOMER_FETCH] Response missing or invalid 'items' (page=%s)", LOG_PREFIX, page)
-            break
-        if total_count is None and "total_count" in data:
-            total_count = data.get("total_count")
-            logger.info("%s [CUSTOMER_FETCH] total_count from API: %s", LOG_PREFIX, total_count)
-        logger.info("%s [CUSTOMER_FETCH] Page %s: got %s items (total so far: %s)", LOG_PREFIX, page, len(items), len(all_items) + len(items))
-        all_items.extend(items)
-        if not items:
-            break
-        if total_count is not None and len(all_items) >= total_count:
-            break
-        page += 1
-    logger.info("%s [CUSTOMER_FETCH] Finished OMS customer fetch. Total fetched: %s", LOG_PREFIX, len(all_items))
-    return all_items
+    params = {
+        "searchCriteria[sortOrders][0][field]": "created_at",
+        "searchCriteria[sortOrders][0][direction]": "DESC",
+    }
+    try:
+        resp = requests.get(
+            url_base,
+            params=params,
+            headers=_oms_headers(),
+            timeout=OMS_REQUEST_TIMEOUT,
+        )
+        logger.debug("%s [CUSTOMER_FETCH] Request URL: %s", LOG_PREFIX, resp.url)
+    except requests.RequestException as e:
+        logger.error("%s [CUSTOMER_FETCH] HTTP request failed: %s", LOG_PREFIX, e)
+        return []
+    if resp.status_code != 200:
+        body_snippet = (resp.text or "")[:500]
+        logger.error("%s [CUSTOMER_FETCH] HTTP %s from OMS. Body: %s", LOG_PREFIX, resp.status_code, body_snippet)
+        if resp.status_code == 401:
+            logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN to an integration token with Magento_Customer::customer access.", LOG_PREFIX)
+        return []
+    try:
+        data = resp.json()
+    except ValueError as e:
+        logger.error("%s [CUSTOMER_FETCH] JSON decode error: %s. Body snippet: %s", LOG_PREFIX, e, (resp.text or "")[:300])
+        return []
+    items = data.get("items")
+    if not isinstance(items, list):
+        logger.error("%s [CUSTOMER_FETCH] Response missing or invalid 'items'", LOG_PREFIX)
+        return []
+    total_count = data.get("total_count")
+    if total_count is not None:
+        logger.info("%s [CUSTOMER_FETCH] total_count from API: %s", LOG_PREFIX, total_count)
+    logger.info("%s [CUSTOMER_FETCH] Got %s items", LOG_PREFIX, len(items))
+    logger.info("%s [CUSTOMER_FETCH] Finished OMS customer fetch. Total fetched: %s", LOG_PREFIX, len(items))
+    return items
 
 
 def sync_oms_customers_to_queue(client_id: str) -> Tuple[int, int]:
