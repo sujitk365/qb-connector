@@ -12,8 +12,11 @@ from typing import Optional
 app = FastAPI()
 
 # ── Logging ─────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# Local: set LOG_LEVEL=DEBUG once to see request URL, total_count, etc.
+_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
+logging.basicConfig(level=_level, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+logger.setLevel(_level)
 LOG_PREFIX = "[OMS_SYNC]"
 
 # ── Config ──────────────────────────────────────────────────────────────────
