@@ -1,34 +1,48 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import Response, PlainTextResponse, JSONResponse
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.responses import Response, PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from contextlib import asynccontextmanager
+import asyncio
 import re
 import uuid
 import html
 import os
-import logging
-import requests
+import xml.sax.saxutils as saxutils
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
+
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI()
-
-# ── Logging ─────────────────────────────────────────────────────────────────
-# Local: set LOG_LEVEL=DEBUG once to see request URL, total_count, etc.
-_level = getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO)
-logging.basicConfig(level=_level, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-logger.setLevel(_level)
-LOG_PREFIX = "[OMS_SYNC]"
-
 # ── Config ──────────────────────────────────────────────────────────────────
-QB_USERNAME = os.environ.get("QB_USERNAME", "qbuser")
-QB_PASSWORD = os.environ.get("QB_PASSWORD", "admin123")
-OMS_BASE_URL = (os.environ.get("OMS_BASE_URL") or "https://oms.kitchen365test.com").rstrip("/")
-OMS_ACCESS_TOKEN = (os.environ.get("OMS_ACCESS_TOKEN") or "").strip()
-OMS_PAGE_SIZE = int(os.environ.get("OMS_PAGE_SIZE", "100"))
-OMS_REQUEST_TIMEOUT = int(os.environ.get("OMS_REQUEST_TIMEOUT", "30"))
+QB_USERNAME = os.getenv("QB_USERNAME", "qbuser")
+QB_PASSWORD = os.getenv("QB_PASSWORD", "admin123")
+OMS_BASE_URL = (os.getenv("OMS_BASE_URL") or "").rstrip("/")
+OMS_ACCESS_TOKEN = os.getenv("OMS_ACCESS_TOKEN") or ""
+OMS_PAGE_SIZE = int(os.getenv("OMS_PAGE_SIZE", "100"))
+OMS_REQUEST_TIMEOUT = int(os.getenv("OMS_REQUEST_TIMEOUT", "30"))
+OMS_SYNC_ON_STARTUP = os.getenv("OMS_SYNC_ON_STARTUP", "false").lower() in ("1", "true", "yes")
+
+QB_CUSTOMER_NAME_MAX_LEN = 41
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if OMS_SYNC_ON_STARTUP and OMS_BASE_URL and OMS_ACCESS_TOKEN:
+        print("OMS_SYNC_ON_STARTUP enabled; loading customers from OMS into queue")
+        try:
+            await asyncio.to_thread(sync_customers_from_oms, QB_USERNAME)
+        except Exception:
+            print("Startup OMS customer sync failed")
+    elif OMS_SYNC_ON_STARTUP:
+        print("OMS_SYNC_ON_STARTUP set but OMS_BASE_URL/OMS_ACCESS_TOKEN missing; skipping")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+http_basic = HTTPBasic(auto_error=False)
 
 # ── In-Memory Store (replace with MySQL in production) ───────────────────────
 #
@@ -158,179 +172,216 @@ job_queue = [
 ]
 
 
-# ── OMS customer fetch and sync ──────────────────────────────────────────────
-
-def _oms_headers() -> dict:
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if OMS_ACCESS_TOKEN:
-        headers["Authorization"] = f"Bearer {OMS_ACCESS_TOKEN}"
-    return headers
+# ── OMS / Magento customer API → QB job queue ───────────────────────────────
 
 
-def magento_customer_to_payload(customer: dict) -> Optional[dict]:
-    """Map Magento customer object to payload expected by build_customer_xml."""
+def escape_qbxml_text(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    return saxutils.escape(str(value), entities={'"': "&quot;", "'": "&apos;"})
+
+
+def verify_sync_credentials(credentials: Optional[HTTPBasicCredentials] = Depends(http_basic)):
+    if credentials is None or credentials.username != QB_USERNAME or credentials.password != QB_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid or missing Basic auth")
+    return credentials.username
+
+
+def fetch_all_oms_customers() -> List[Dict[str, Any]]:
+    """GET /rest/V1/customers/search with created_at DESC only (no page/pageSize params)."""
+    if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
+        print("OMS_BASE_URL or OMS_ACCESS_TOKEN is empty; cannot call customers/search")
+        raise RuntimeError("OMS customer API is not configured (check .env)")
+
+    headers = {
+        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
+        "Accept": "application/json",
+    }
+    url = f"{OMS_BASE_URL}/rest/V1/customers/search"
+    params = {
+        "searchCriteria[sortOrders][0][field]": "created_at",
+        "searchCriteria[sortOrders][0][direction]": "DESC",
+    }
+    print(f"OMS customers/search request url={url} (sort created_at DESC only)")
     try:
-        first = (customer.get("firstname") or "").strip()
-        last = (customer.get("lastname") or "").strip()
-        email = (customer.get("email") or "").strip()
-        if not email:
-            logger.error("%s [CUSTOMER_FETCH] Skipping customer with missing email: id=%s", LOG_PREFIX, customer.get("id"))
-            return None
-        addresses = customer.get("addresses") or []
-        default_billing = customer.get("default_billing")
-        addr = None
-        if default_billing and isinstance(addresses, list):
-            for a in addresses:
-                if isinstance(a, dict) and str(a.get("id")) == str(default_billing):
-                    addr = a
-                    break
-        if not addr and addresses:
-            addr = addresses[0] if isinstance(addresses[0], dict) else None
-        street = ""
-        city = ""
-        state = ""
-        postal = ""
-        country = ""
-        company = ""
-        phone = ""
-        if addr:
-            street_list = addr.get("street")
-            if isinstance(street_list, list):
-                street = (street_list[0] or "").strip() if street_list else ""
-            elif isinstance(street_list, str):
-                street = street_list.strip()
-            city = (addr.get("city") or "").strip()
-            region = addr.get("region")
-            if isinstance(region, dict):
-                state = (region.get("region_code") or region.get("region") or "").strip()
-            elif isinstance(region, str):
-                state = region.strip()
-            postal = (addr.get("postcode") or "").strip()
-            country_id = (addr.get("country_id") or "").strip()
-            country = country_id
-            company = (addr.get("company") or "").strip()
-            phone = (addr.get("telephone") or "").strip()
-        name = f"{first} {last}".strip() or email
-        if not name:
-            name = email
-        name = f"Kitchen365 {name}" if name else f"Kitchen365 {email}"
-        return {
-            "name": name,
-            "company": company,
-            "first_name": first,
-            "last_name": last,
-            "email": email,
-            "phone": phone,
-            "addr1": street,
-            "city": city,
-            "state": state,
-            "postal": postal,
-            "country": country,
-        }
-    except Exception as e:
-        logger.exception("%s [CUSTOMER_FETCH] Failed to map customer id=%s: %s", LOG_PREFIX, customer.get("id"), e)
+        resp = requests.get(
+            url,
+            headers=headers,
+            params=params,
+            timeout=OMS_REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as e:
+        print(f"OMS customers/search network error: {e}")
+        raise
+
+    if resp.status_code != 200:
+        print(f"OMS customers/search HTTP {resp.status_code} body_snippet={repr((resp.text or '')[:500])}")
+        raise RuntimeError(f"OMS customers/search failed: HTTP {resp.status_code}")
+
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"OMS customers/search invalid JSON body_snippet={repr((resp.text or '')[:300])}")
+        raise
+
+    items = data.get("items") or []
+    total_count = data.get("total_count")
+    print(f"OMS customers/search got_items={len(items)} total_count={total_count}")
+    return items
+
+
+def _pick_billing_address(customer: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    addresses = customer.get("addresses") or []
+    if not addresses:
         return None
+    default_billing_id = customer.get("default_billing")
+    if default_billing_id is not None:
+        for a in addresses:
+            if a.get("id") == default_billing_id:
+                return a
+    for a in addresses:
+        if a.get("default_billing"):
+            return a
+    return addresses[0]
 
 
-def fetch_all_oms_customers() -> list:
-    """Fetch all customers from OMS. Sort params: field + direction; paginate with pageSize/currentPage to get all (e.g. 372)."""
-    url_base = f"{OMS_BASE_URL}/rest/V1/customers/search"
-    all_items = []
-    page = 1
-    total_count = None
-    if not OMS_ACCESS_TOKEN:
-        logger.warning("%s [CUSTOMER_FETCH] OMS_ACCESS_TOKEN not set; request will likely get 401. Set env OMS_ACCESS_TOKEN to your Bearer token.", LOG_PREFIX)
-    logger.info("%s [CUSTOMER_FETCH] Starting OMS customer fetch from %s", LOG_PREFIX, OMS_BASE_URL)
-    while True:
-        params = {
-            "searchCriteria[sortOrders][0][field]": "created_at",
-            "searchCriteria[sortOrders][0][direction]": "DESC",
-            "searchCriteria[currentPage]": page,
-        }
-        try:
-            resp = requests.get(
-                url_base,
-                params=params,
-                headers=_oms_headers(),
-                timeout=OMS_REQUEST_TIMEOUT,
-            )
-            logger.debug("%s [CUSTOMER_FETCH] Request URL: %s", LOG_PREFIX, resp.url)
-        except requests.RequestException as e:
-            logger.error("%s [CUSTOMER_FETCH] HTTP request failed (page=%s): %s", LOG_PREFIX, page, e)
-            break
-        if resp.status_code != 200:
-            body_snippet = (resp.text or "")[:500]
-            logger.error("%s [CUSTOMER_FETCH] HTTP %s from OMS (page=%s). Body: %s", LOG_PREFIX, resp.status_code, page, body_snippet)
-            if resp.status_code == 401:
-                logger.error("%s [CUSTOMER_FETCH] Set OMS_ACCESS_TOKEN to an integration token with Magento_Customer::customer access.", LOG_PREFIX)
-            break
-        try:
-            data = resp.json()
-        except ValueError as e:
-            logger.error("%s [CUSTOMER_FETCH] JSON decode error (page=%s): %s. Body snippet: %s", LOG_PREFIX, page, e, (resp.text or "")[:300])
-            break
-        items = data.get("items")
-        if not isinstance(items, list):
-            logger.error("%s [CUSTOMER_FETCH] Response missing or invalid 'items' (page=%s)", LOG_PREFIX, page)
-            break
-        if total_count is None and "total_count" in data:
-            total_count = data.get("total_count")
-            logger.info("%s [CUSTOMER_FETCH] total_count from API: %s", LOG_PREFIX, total_count)
-        logger.info("%s [CUSTOMER_FETCH] Page %s: got %s items (total so far: %s)", LOG_PREFIX, page, len(items), len(all_items) + len(items))
-        all_items.extend(items)
-        if not items:
-            break
-        if total_count is not None and len(all_items) >= total_count:
-            break
-        page += 1
-    logger.info("%s [CUSTOMER_FETCH] Finished OMS customer fetch. Total fetched: %s", LOG_PREFIX, len(all_items))
-    return all_items
+def magento_customer_to_job_payload(customer: Dict[str, Any]) -> Tuple[dict, str]:
+    """Map Magento REST customer → same payload keys as static push_customer jobs."""
+    cid = customer.get("id")
+    if cid is None:
+        raise ValueError("customer missing id")
+    k365_id = str(cid)
+
+    email = (customer.get("email") or "").strip()
+    first = (customer.get("firstname") or "").strip()
+    last = (customer.get("lastname") or "").strip()
+
+    company = ""
+    addr1 = ""
+    city = ""
+    state = ""
+    postal = ""
+    country = ""
+    phone = ""
+
+    addr = _pick_billing_address(customer)
+    if addr:
+        company = (addr.get("company") or "").strip()
+        street = addr.get("street")
+        if isinstance(street, list):
+            parts = [s for s in street if s]
+            addr1 = ", ".join(parts) if parts else ""
+        else:
+            addr1 = str(street or "").strip()
+        city = (addr.get("city") or "").strip()
+        region = addr.get("region") or {}
+        if isinstance(region, dict):
+            state = (region.get("region_code") or region.get("region") or "").strip()
+        else:
+            state = str(region or "").strip()
+        if not state:
+            state = (addr.get("region_code") or "").strip()
+        postal = (addr.get("postcode") or "").strip()
+        country = (addr.get("country_id") or "").strip()
+        phone = (addr.get("telephone") or "").strip()
+
+    display_name = f"{first} {last}".strip() or (email.split("@")[0] if email else "") or f"Customer-{k365_id}"
+    if company and company.lower() not in display_name.lower():
+        display_name = f"{company} — {display_name}"
+    display_name = display_name[:QB_CUSTOMER_NAME_MAX_LEN]
+
+    payload = {
+        "name": display_name,
+        "company": company[:100] if company else "",
+        "first_name": first[:50],
+        "last_name": last[:50],
+        "email": email[:100],
+        "phone": phone[:30],
+        "addr1": addr1[:200],
+        "city": city[:50],
+        "state": state[:50],
+        "postal": postal[:20],
+        "country": (country[:50] if country else "US"),
+    }
+    return payload, k365_id
 
 
-def sync_oms_customers_to_queue(client_id: str) -> Tuple[int, int]:
+def _can_enqueue_customer_job(k365_id: str) -> bool:
+    """False if already in QB or an active/completed queue job exists; drop dead/failed to allow retry."""
+    if transaction_map.get(f"customer:{k365_id}"):
+        return False
+
+    to_drop: List[int] = []
+    for idx, j in enumerate(job_queue):
+        if j.get("operation") != "push_customer" or str(j.get("k365_id")) != str(k365_id):
+            continue
+        st = j.get("status")
+        if st in ("pending", "processing", "hold", "completed"):
+            return False
+        if st in ("failed", "dead"):
+            to_drop.append(idx)
+
+    for idx in reversed(to_drop):
+        dropped = job_queue.pop(idx)
+        print(f"Removed prior {dropped.get('status')} customer job id={dropped.get('id')} k365_id={k365_id} for re-queue from OMS")
+    return True
+
+
+def sync_customers_from_oms(client_id: str) -> Dict[str, Any]:
     """
-    Fetch all OMS customers, map to push_customer jobs, and append to job_queue for those not already
-    in transaction_map or already pending in queue. Returns (added_count, skipped_count).
+    Fetch all customers from OMS and append push_customer jobs (priority 3, source oms_api).
+    Matches existing job payload fields for QB CustomerAdd.
     """
-    raw_customers = fetch_all_oms_customers()
-    existing_pending_k365 = {j["k365_id"] for j in job_queue if j.get("k365_id") and j["status"] == "pending"}
-    added = 0
-    skipped = 0
-    for customer in raw_customers:
-        cid = customer.get("id")
-        if cid is None:
-            logger.debug("%s [CUSTOMER_FETCH] Skipping customer with no id", LOG_PREFIX)
-            skipped += 1
+    stats: Dict[str, Any] = {
+        "fetched": 0,
+        "queued": 0,
+        "skipped": 0,
+        "mapping_errors": 0,
+        "ok": True,
+        "error": None,
+    }
+    try:
+        customers = fetch_all_oms_customers()
+    except Exception as e:
+        stats["ok"] = False
+        stats["error"] = str(e)
+        print(f"OMS customer fetch failed: {e}")
+        return stats
+
+    stats["fetched"] = len(customers)
+    for c in customers:
+        try:
+            payload, k365_id = magento_customer_to_job_payload(c)
+        except Exception as e:
+            stats["mapping_errors"] += 1
+            print(f"Skip customer id={c.get('id')}: mapping error: {e}")
             continue
-        k365_id = str(cid)
-        if transaction_map.get(f"customer:{k365_id}"):
-            skipped += 1
+
+        if not _can_enqueue_customer_job(k365_id):
+            stats["skipped"] += 1
             continue
-        if k365_id in existing_pending_k365:
-            skipped += 1
-            continue
-        payload = magento_customer_to_payload(customer)
-        if not payload:
-            skipped += 1
-            continue
-        job_id = f"job_oms_{k365_id}"
-        job_queue.append({
-            "id": job_id,
-            "client_id": client_id,
-            "operation": "push_customer",
-            "priority": 3,
-            "source": "customer_flow",
-            "status": "pending",
-            "k365_id": k365_id,
-            "linked_order": None,
-            "retry_count": 0,
-            "qb_id": None,
-            "payload": payload,
-        })
-        existing_pending_k365.add(k365_id)
-        added += 1
-    logger.info("%s [CUSTOMER_FETCH] Sync complete: jobs added=%s, skipped=%s", LOG_PREFIX, added, skipped)
-    return added, skipped
+
+        job_id = f"oms_customer_{k365_id}"
+        job_queue.append(
+            {
+                "id": job_id,
+                "client_id": client_id,
+                "operation": "push_customer",
+                "priority": 3,
+                "source": "oms_api",
+                "status": "pending",
+                "k365_id": k365_id,
+                "linked_order": None,
+                "retry_count": 0,
+                "qb_id": None,
+                "payload": payload,
+            }
+        )
+        stats["queued"] += 1
+        print(f"Queued push_customer from OMS job_id={job_id} k365_id={k365_id} email={payload.get('email')} qb_name={payload.get('name')!r}")
+
+    print(f"OMS→QB queue sync done: fetched={stats['fetched']} queued={stats['queued']} skipped={stats['skipped']} mapping_errors={stats['mapping_errors']}")
+    return stats
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -383,7 +434,8 @@ def resolve_dependencies(completed_job_id: str):
                 job["status"] = "pending"
 
 def build_customer_xml(payload: dict, request_id: str = "1") -> str:
-    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="{request_id}"><CustomerAdd><Name>{payload['name']}</Name><CompanyName>{payload.get('company','')}</CompanyName><FirstName>{payload.get('first_name','')}</FirstName><LastName>{payload.get('last_name','')}</LastName><BillAddress><Addr1>{payload.get('addr1','')}</Addr1><City>{payload.get('city','')}</City><State>{payload.get('state','')}</State><PostalCode>{payload.get('postal','')}</PostalCode><Country>{payload.get('country','')}</Country></BillAddress><Phone>{payload.get('phone','')}</Phone><Email>{payload.get('email','')}</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
+    rid = escape_qbxml_text(request_id)
+    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="{rid}"><CustomerAdd><Name>{escape_qbxml_text(payload.get('name'))}</Name><CompanyName>{escape_qbxml_text(payload.get('company',''))}</CompanyName><FirstName>{escape_qbxml_text(payload.get('first_name',''))}</FirstName><LastName>{escape_qbxml_text(payload.get('last_name',''))}</LastName><BillAddress><Addr1>{escape_qbxml_text(payload.get('addr1',''))}</Addr1><City>{escape_qbxml_text(payload.get('city',''))}</City><State>{escape_qbxml_text(payload.get('state',''))}</State><PostalCode>{escape_qbxml_text(payload.get('postal',''))}</PostalCode><Country>{escape_qbxml_text(payload.get('country',''))}</Country></BillAddress><Phone>{escape_qbxml_text(payload.get('phone',''))}</Phone><Email>{escape_qbxml_text(payload.get('email',''))}</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
 
 def build_order_xml(payload: dict, request_id: str = "1") -> str:
     lines_xml = ""
@@ -434,6 +486,18 @@ def receive_response(progress: int) -> str:
 
 
 # ── Status endpoint (simple dashboard) ──────────────────────────────────────
+@app.post("/sync/customers-from-oms")
+async def sync_customers_from_oms_endpoint(_user: str = Depends(verify_sync_credentials)):
+    """
+    Pull all customers from OMS (Magento customers/search, created_at DESC) and queue push_customer jobs.
+    Use HTTP Basic auth: same QB_USERNAME / QB_PASSWORD as QuickBooks Web Connector.
+    """
+    stats = await asyncio.to_thread(sync_customers_from_oms, QB_USERNAME)
+    if not stats.get("ok"):
+        raise HTTPException(status_code=502, detail=stats)
+    return stats
+
+
 @app.get("/status")
 async def status():
     return {
@@ -464,17 +528,6 @@ async def qbwc_get():
     return PlainTextResponse("QB Connector Service Ready")
 
 
-@app.post("/sync/customers")
-async def sync_customers():
-    """Manual trigger: fetch OMS customers and merge push_customer jobs into the queue."""
-    try:
-        added, skipped = sync_oms_customers_to_queue(QB_USERNAME)
-        return {"ok": True, "jobs_added": added, "skipped": skipped}
-    except Exception as e:
-        logger.exception("%s [CUSTOMER_FETCH] Manual sync failed: %s", LOG_PREFIX, e)
-        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
-
-
 # ── Main QBWC SOAP Handler ───────────────────────────────────────────────────
 @app.post("/qbwc")
 async def qbwc_handler(request: Request):
@@ -503,12 +556,6 @@ async def qbwc_handler(request: Request):
 
         if u == QB_USERNAME and p == QB_PASSWORD:
             ticket = str(uuid.uuid4())
-
-            # Sync OMS customers into job queue (Option A: on every authenticate)
-            try:
-                sync_oms_customers_to_queue(u)
-            except Exception as e:
-                logger.exception("%s [CUSTOMER_FETCH] Sync failed during authenticate: %s", LOG_PREFIX, e)
 
             # Load next batch of jobs for this client
             jobs = get_next_jobs_for_client(u, max_jobs=5)
