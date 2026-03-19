@@ -59,15 +59,18 @@ OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "30"))
 OMS_SYNC_ON_AUTH = os.getenv("OMS_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
 OMS_SYNC_API_KEY = (os.getenv("OMS_SYNC_API_KEY") or "").strip()
 OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
+# How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
+QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     print("🚀 QB Connector starting…")
     LOG.info(
-        "QB Connector starting | OMS configured=%s | sync_on_auth=%s",
+        "QB Connector starting | OMS configured=%s | sync_on_auth=%s | qbwc_job_batch=%s",
         bool(OMS_BASE_URL and OMS_ACCESS_TOKEN),
         OMS_SYNC_ON_AUTH,
+        QBWC_JOB_BATCH_SIZE,
     )
     yield
     print("🛑 QB Connector shutting down")
@@ -423,7 +426,7 @@ def update_job(job_id: str, **kwargs):
     if job:
         job.update(kwargs)
 
-def get_next_jobs_for_client(client_id: str, max_jobs: int = 5):
+def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     """
     Pick next batch of jobs for this client in priority order.
     Respects:
@@ -438,7 +441,8 @@ def get_next_jobs_for_client(client_id: str, max_jobs: int = 5):
     ]
     # Sort by priority ascending (1 = highest priority)
     pending.sort(key=lambda x: x["priority"])
-    return pending[:max_jobs]
+    limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
+    return pending[:limit]
 
 def resolve_dependencies(completed_job_id: str):
     """
@@ -628,7 +632,7 @@ async def qbwc_handler(request: Request):
                     LOG.exception("OMS customer sync on auth failed (continuing with existing queue): %s", e)
 
             # Load next batch of jobs for this client
-            jobs = get_next_jobs_for_client(u, max_jobs=5)
+            jobs = get_next_jobs_for_client(u)
 
             if jobs:
                 sessions[ticket] = {
