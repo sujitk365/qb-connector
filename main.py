@@ -840,13 +840,17 @@ async def qbwc_handler(request: Request):
 
     # ── getLastError ───────────────────────────────────────────
     elif "getLastError" in body_str:
-        # QBWC requires a non-empty human-readable string; empty element causes "GetLastError failed"
-        err = (qbwc_last_error or "No error").strip()
+        # soap_envelope already wraps in <getLastErrorResult>; do NOT nest another getLastErrorResult
+        # (double nesting breaks parsing and QBWC may show "GetLastError failed" or odd messages).
+        err = (qbwc_last_error or "").strip()
         if len(err) > 2000:
             err = err[:1997] + "..."
-        safe_err = escape_qbxml_text(err)
-        print(f"⚠️ getLastError called → {err[:200]!r}")
-        xml = soap_envelope("getLastError", f"<getLastErrorResult>{safe_err}</getLastErrorResult>")
+        inner = escape_qbxml_text(err) if err else ""
+        if err:
+            print(f"⚠️ getLastError → {err[:200]!r}")
+        else:
+            print("getLastError (no pending error)")
+        xml = soap_envelope("getLastError", inner)
         qbwc_last_error = ""
 
     # ── closeConnection ────────────────────────────────────────
