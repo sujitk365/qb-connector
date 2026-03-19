@@ -53,7 +53,8 @@ http_basic = HTTPBasic(auto_error=False)
 # last_inventory_pull: timestamp of last inventory sync
 
 sessions = {}          # { ticket: { client_id, jobs, index, total } }
-transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
+# qb_transaction_map (in-memory): customer keys store {"list_id", "edit_sequence"} for CustomerMod; orders keep TxnID string.
+transaction_map: Dict[str, Any] = {}
 last_inventory_pull: Optional[datetime] = None
 # QBWC calls getLastError after failures; empty getLastErrorResult causes "GetLastError failed" in the UI.
 qbwc_last_error: str = ""
@@ -182,6 +183,49 @@ def escape_qbxml_text(value: Optional[str]) -> str:
     if value is None:
         return ""
     return saxutils.escape(str(value), entities={'"': "&quot;", "'": "&apos;"})
+
+
+def _normalize_customer_map_entry(entry: Any) -> Optional[Dict[str, str]]:
+    """Legacy: transaction_map stored ListID string only."""
+    if entry is None:
+        return None
+    if isinstance(entry, str) and entry.strip():
+        return {"list_id": entry.strip(), "edit_sequence": ""}
+    if isinstance(entry, dict):
+        lid = (entry.get("list_id") or "").strip()
+        if not lid:
+            return None
+        es = (entry.get("edit_sequence") or "").strip()
+        return {"list_id": lid, "edit_sequence": es}
+    return None
+
+
+def txn_map_customer_get(k365_id: str) -> Optional[Dict[str, str]]:
+    return _normalize_customer_map_entry(transaction_map.get(f"customer:{k365_id}"))
+
+
+def txn_map_customer_set(k365_id: str, list_id: str, edit_sequence: str = "") -> None:
+    transaction_map[f"customer:{k365_id}"] = {
+        "list_id": (list_id or "").strip(),
+        "edit_sequence": (edit_sequence or "").strip(),
+    }
+
+
+def txn_map_customer_clear(k365_id: str) -> None:
+    transaction_map.pop(f"customer:{k365_id}", None)
+
+
+def parse_customer_ret_ids(raw: str) -> Optional[Tuple[str, str]]:
+    """First CustomerRet ListID + EditSequence in QB response XML."""
+    block = re.search(r"<CustomerRet>(.*?)</CustomerRet>", raw, re.DOTALL)
+    if not block:
+        return None
+    inner = block.group(1)
+    lid = re.search(r"<ListID>([^<]+)</ListID>", inner)
+    es = re.search(r"<EditSequence>([^<]+)</EditSequence>", inner)
+    if not lid:
+        return None
+    return (lid.group(1).strip(), es.group(1).strip() if es else "")
 
 
 def verify_sync_credentials(credentials: Optional[HTTPBasicCredentials] = Depends(http_basic)):
@@ -342,35 +386,47 @@ def magento_customer_to_job_payload(customer: Dict[str, Any]) -> Tuple[dict, str
     return payload, k365_id
 
 
-def _can_enqueue_customer_job(k365_id: str) -> bool:
-    """False if already in QB or an active/completed queue job exists; drop dead/failed to allow retry."""
-    if transaction_map.get(f"customer:{k365_id}"):
-        return False
-
+def _can_enqueue_customer_job(k365_id: str, source: str = "oms_api") -> bool:
+    """
+    Block only if a duplicate *active* job exists for this K365 id.
+    Completed OMS bulk jobs are removed so the next /sync/customers-from-oms can Add/Mod everyone again.
+    Mapped customers still queue (CustomerMod / query+mod), not skipped.
+    """
     to_drop: List[int] = []
     for idx, j in enumerate(job_queue):
         if j.get("operation") != "push_customer" or str(j.get("k365_id")) != str(k365_id):
             continue
         st = j.get("status")
-        if st in ("pending", "processing", "hold", "completed"):
+        if st in ("pending", "processing", "hold"):
             return False
         if st in ("failed", "dead"):
+            to_drop.append(idx)
+        if (
+            st == "completed"
+            and source == "oms_api"
+            and str(j.get("id", "")).startswith("oms_customer_")
+        ):
             to_drop.append(idx)
 
     for idx in reversed(to_drop):
         dropped = job_queue.pop(idx)
-        print(f"Removed prior {dropped.get('status')} customer job id={dropped.get('id')} k365_id={k365_id} for re-queue from OMS")
+        print(
+            f"Removed prior {dropped.get('status')} customer job id={dropped.get('id')} "
+            f"k365_id={k365_id} for re-queue from OMS"
+        )
     return True
 
 
 def sync_customers_from_oms(client_id: str) -> Dict[str, Any]:
     """
     Fetch all customers from OMS and append push_customer jobs (priority 3, source oms_api).
-    Matches existing job payload fields for QB CustomerAdd.
+    Uses qb_transaction_map: new → CustomerAddRq; existing ListID (+ EditSequence or query first) → CustomerModRq.
     """
     stats: Dict[str, Any] = {
         "fetched": 0,
         "queued": 0,
+        "queued_add": 0,
+        "queued_mod": 0,
         "skipped": 0,
         "mapping_errors": 0,
         "ok": True,
@@ -393,9 +449,21 @@ def sync_customers_from_oms(client_id: str) -> Dict[str, Any]:
             print(f"Skip customer id={c.get('id')}: mapping error: {e}")
             continue
 
-        if not _can_enqueue_customer_job(k365_id):
+        if not _can_enqueue_customer_job(k365_id, source="oms_api"):
             stats["skipped"] += 1
             continue
+
+        qb_rec = txn_map_customer_get(k365_id)
+        if qb_rec:
+            payload["qb_list_id"] = qb_rec["list_id"]
+            payload["qb_edit_sequence"] = qb_rec["edit_sequence"]
+            sync_note = "mod" if qb_rec["edit_sequence"] else "query_then_mod"
+            stats["queued_mod"] += 1
+        else:
+            payload.pop("qb_list_id", None)
+            payload.pop("qb_edit_sequence", None)
+            sync_note = "add"
+            stats["queued_add"] += 1
 
         job_id = f"oms_customer_{k365_id}"
         job_queue.append(
@@ -409,14 +477,21 @@ def sync_customers_from_oms(client_id: str) -> Dict[str, Any]:
                 "k365_id": k365_id,
                 "linked_order": None,
                 "retry_count": 0,
-                "qb_id": None,
+                "qb_id": qb_rec["list_id"] if qb_rec else None,
                 "payload": payload,
             }
         )
         stats["queued"] += 1
-        print(f"Queued push_customer from OMS job_id={job_id} k365_id={k365_id} email={payload.get('email')} qb_name={payload.get('name')!r}")
+        print(
+            f"Queued push_customer from OMS job_id={job_id} k365_id={k365_id} "
+            f"sync={sync_note} email={payload.get('email')} qb_name={payload.get('name')!r}"
+        )
 
-    print(f"OMS→QB queue sync done: fetched={stats['fetched']} queued={stats['queued']} skipped={stats['skipped']} mapping_errors={stats['mapping_errors']}")
+    print(
+        f"OMS→QB queue sync done: fetched={stats['fetched']} queued={stats['queued']} "
+        f"(add={stats['queued_add']} mod_or_query={stats['queued_mod']}) "
+        f"skipped={stats['skipped']} mapping_errors={stats['mapping_errors']}"
+    )
     return stats
 
 
@@ -469,9 +544,24 @@ def resolve_dependencies(completed_job_id: str):
                 print(f"🔓 Unblocking order job {job['id']} — customer is ready")
                 job["status"] = "pending"
 
-def build_customer_xml(payload: dict, request_id: str = "1") -> str:
+def build_customer_add_xml(payload: dict, request_id: str = "1") -> str:
     rid = escape_qbxml_text(request_id)
     return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="{rid}"><CustomerAdd><Name>{escape_qbxml_text(payload.get('name'))}</Name><CompanyName>{escape_qbxml_text(payload.get('company',''))}</CompanyName><FirstName>{escape_qbxml_text(payload.get('first_name',''))}</FirstName><LastName>{escape_qbxml_text(payload.get('last_name',''))}</LastName><BillAddress><Addr1>{escape_qbxml_text(payload.get('addr1',''))}</Addr1><City>{escape_qbxml_text(payload.get('city',''))}</City><State>{escape_qbxml_text(payload.get('state',''))}</State><PostalCode>{escape_qbxml_text(payload.get('postal',''))}</PostalCode><Country>{escape_qbxml_text(payload.get('country',''))}</Country></BillAddress><Phone>{escape_qbxml_text(payload.get('phone',''))}</Phone><Email>{escape_qbxml_text(payload.get('email',''))}</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
+
+
+def build_customer_query_xml(list_id: str, request_id: str = "1") -> str:
+    rid = escape_qbxml_text(request_id)
+    lid = escape_qbxml_text(list_id)
+    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerQueryRq requestID="{rid}"><ListID>{lid}</ListID></CustomerQueryRq></QBXMLMsgsRq></QBXML>"""
+
+
+def build_customer_mod_xml(
+    payload: dict, list_id: str, edit_sequence: str, request_id: str = "1"
+) -> str:
+    rid = escape_qbxml_text(request_id)
+    lid = escape_qbxml_text(list_id)
+    es = escape_qbxml_text(edit_sequence)
+    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerModRq requestID="{rid}"><CustomerMod><ListID>{lid}</ListID><EditSequence>{es}</EditSequence><Name>{escape_qbxml_text(payload.get('name'))}</Name><CompanyName>{escape_qbxml_text(payload.get('company',''))}</CompanyName><FirstName>{escape_qbxml_text(payload.get('first_name',''))}</FirstName><LastName>{escape_qbxml_text(payload.get('last_name',''))}</LastName><BillAddress><Addr1>{escape_qbxml_text(payload.get('addr1',''))}</Addr1><City>{escape_qbxml_text(payload.get('city',''))}</City><State>{escape_qbxml_text(payload.get('state',''))}</State><PostalCode>{escape_qbxml_text(payload.get('postal',''))}</PostalCode><Country>{escape_qbxml_text(payload.get('country',''))}</Country></BillAddress><Phone>{escape_qbxml_text(payload.get('phone',''))}</Phone><Email>{escape_qbxml_text(payload.get('email',''))}</Email></CustomerMod></CustomerModRq></QBXMLMsgsRq></QBXML>"""
 
 def build_order_xml(payload: dict, request_id: str = "1") -> str:
     rid = escape_qbxml_text(request_id)
@@ -679,8 +769,21 @@ async def qbwc_handler(request: Request):
             print(f"📤 Processing job {job['id']} | {job['operation']} | priority {job['priority']}")
 
             if job["operation"] == "push_customer":
-                qbxml = build_customer_xml(job["payload"], request_id=job["id"])
-                print(f"👤 Pushing customer: {job['payload']['name']}")
+                pl = job["payload"]
+                lid = (pl.get("qb_list_id") or pl.get("list_id") or "").strip()
+                es = (pl.get("qb_edit_sequence") or pl.get("edit_sequence") or "").strip()
+                if lid and not es:
+                    job["_qb_request_kind"] = "CustomerQueryRq"
+                    qbxml = build_customer_query_xml(lid, request_id=job["id"])
+                    print(f"👤 QB CustomerQuery (ListID) for K365 job: {job['payload'].get('name')}")
+                elif lid and es:
+                    job["_qb_request_kind"] = "CustomerModRq"
+                    qbxml = build_customer_mod_xml(pl, lid, es, request_id=job["id"])
+                    print(f"👤 CustomerMod: {job['payload'].get('name')}")
+                else:
+                    job["_qb_request_kind"] = "CustomerAddRq"
+                    qbxml = build_customer_add_xml(pl, request_id=job["id"])
+                    print(f"👤 CustomerAdd: {job['payload'].get('name')}")
 
             elif job["operation"] == "push_order":
                 qbxml = build_order_xml(job["payload"], request_id=job["id"])
@@ -718,6 +821,7 @@ async def qbwc_handler(request: Request):
         if response_match and session:
             raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
+            advance_session_index = True
 
             # ── Check status ──────────────────────────────────
             status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw)
@@ -731,31 +835,85 @@ async def qbwc_handler(request: Request):
 
             # ── Handle by operation ───────────────────────────
             if job["operation"] == "push_customer":
-                # ListID appears in CustomerRet (success) or nested in response
-                list_id = re.search(r'<ListID>([^<]+)</ListID>', raw)
-                name    = re.search(r'<FullName>([^<]+)</FullName>', raw)
+                kind = job.get("_qb_request_kind") or "CustomerAddRq"
+                pl = job["payload"]
+                kid = str(job["k365_id"])
 
-                if list_id:
-                    qb_list_id = list_id.group(1).strip()
-                    update_job(job["id"], status="completed", qb_id=qb_list_id)
-                    transaction_map[f"customer:{job['k365_id']}"] = qb_list_id
-                    qbwc_last_error = ""
-                    print(f"✅ Customer created! ListID: {qb_list_id}")
-                    print(f"👤 QB Name: {name.group(1) if name else 'N/A'}")
-                    # Unblock any orders waiting for this customer
-                    resolve_dependencies(job["id"])
-                elif code == "3100" or (msg and "already exists" in msg.lower()):
-                    # Duplicate name / already exists — do not retry forever
-                    print(f"⚠️ Customer already exists in QB — marking completed")
-                    update_job(job["id"], status="completed")
-                    qbwc_last_error = ""
+                def _dup_or_exists() -> bool:
+                    return code == "3100" or (
+                        msg and "already exists" in msg.lower()
+                    )
+
+                if kind == "CustomerQueryRq":
+                    parsed = parse_customer_ret_ids(raw)
+                    if parsed:
+                        plid, pes = parsed
+                        pl["qb_list_id"] = plid
+                        pl["qb_edit_sequence"] = pes
+                        txn_map_customer_set(kid, plid, pes)
+                        update_job(job["id"], qb_id=plid)
+                        qbwc_last_error = ""
+                        print(f"✅ CustomerQuery OK — EditSequence cached for Mod (ListID={plid})")
+                        advance_session_index = False
+                    elif sev == "Error" or (code and code != "0"):
+                        txn_map_customer_clear(kid)
+                        pl.pop("qb_list_id", None)
+                        pl.pop("qb_edit_sequence", None)
+                        qbwc_last_error = f"CustomerQuery failed (code={code}): {msg or raw[:400]}"
+                        print(f"⚠️ CustomerQuery failed — will retry same job as CustomerAdd. {qbwc_last_error}")
+                        advance_session_index = False
+                    else:
+                        qbwc_last_error = "CustomerQuery returned no CustomerRet"
+                        retry = job["retry_count"] + 1
+                        new_status = "dead" if retry >= 3 else "failed"
+                        update_job(job["id"], status=new_status, retry_count=retry)
+
+                elif kind == "CustomerModRq":
+                    parsed = parse_customer_ret_ids(raw)
+                    if parsed:
+                        plid, pes = parsed
+                        txn_map_customer_set(kid, plid, pes)
+                        update_job(job["id"], status="completed", qb_id=plid)
+                        qbwc_last_error = ""
+                        print(f"✅ CustomerMod OK ListID={plid}")
+                        resolve_dependencies(job["id"])
+                    elif _dup_or_exists():
+                        print(f"⚠️ CustomerMod duplicate/exists — marking completed")
+                        update_job(job["id"], status="completed")
+                        qbwc_last_error = ""
+                    else:
+                        err_detail = msg or raw[:500] or "Unknown CustomerMod error"
+                        qbwc_last_error = f"CustomerMod failed (code={code}): {err_detail}"
+                        print(f"❌ CustomerMod failed: {msg}")
+                        retry = job["retry_count"] + 1
+                        new_status = "dead" if retry >= 3 else "failed"
+                        update_job(job["id"], status=new_status, retry_count=retry)
+
                 else:
-                    err_detail = msg or raw[:500] or "Unknown QB customer error"
-                    qbwc_last_error = f"CustomerAdd failed (code={code}): {err_detail}"
-                    print(f"❌ Customer push failed: {msg}")
-                    retry = job["retry_count"] + 1
-                    new_status = "dead" if retry >= 3 else "failed"
-                    update_job(job["id"], status=new_status, retry_count=retry)
+                    # CustomerAddRq
+                    parsed = parse_customer_ret_ids(raw)
+                    name = re.search(r"<FullName>([^<]+)</FullName>", raw)
+
+                    if parsed:
+                        qb_list_id, qb_es = parsed
+                        txn_map_customer_set(kid, qb_list_id, qb_es)
+                        update_job(job["id"], status="completed", qb_id=qb_list_id)
+                        qbwc_last_error = ""
+                        print(f"✅ CustomerAdd OK ListID: {qb_list_id}")
+                        print(f"👤 QB Name: {name.group(1) if name else 'N/A'}")
+                        resolve_dependencies(job["id"])
+                    elif _dup_or_exists():
+                        print(f"⚠️ Customer already exists in QB (3100) — marking completed")
+                        update_job(job["id"], status="completed")
+                        qbwc_last_error = ""
+                        resolve_dependencies(job["id"])
+                    else:
+                        err_detail = msg or raw[:500] or "Unknown QB customer error"
+                        qbwc_last_error = f"CustomerAdd failed (code={code}): {err_detail}"
+                        print(f"❌ Customer push failed: {msg}")
+                        retry = job["retry_count"] + 1
+                        new_status = "dead" if retry >= 3 else "failed"
+                        update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "push_order":
                 txn_id  = re.search(r'<TxnID>(.*?)</TxnID>', raw)
@@ -794,8 +952,9 @@ async def qbwc_handler(request: Request):
                 update_job(job["id"], status="completed")
                 qbwc_last_error = ""
 
-            # ── Advance session index ─────────────────────────
-            session["index"] += 1
+            # ── Advance session index (same job may run twice: Query → Mod) ──
+            if advance_session_index:
+                session["index"] += 1
             remaining = session["total"] - session["index"]
 
             if remaining > 0:
