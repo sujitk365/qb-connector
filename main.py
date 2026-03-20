@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, List, Optional, Tuple
+from urllib.parse import urlencode
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
@@ -59,6 +60,9 @@ OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "30"))
 OMS_SYNC_ON_AUTH = os.getenv("OMS_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
 OMS_SYNC_API_KEY = (os.getenv("OMS_SYNC_API_KEY") or "").strip()
 OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
+OMS_ORDER_STATUS = (os.getenv("OMS_ORDER_STATUS") or "complete").strip()
+OMS_ORDER_TEST_ENTITY_ID = (os.getenv("OMS_ORDER_TEST_ENTITY_ID") or "").strip()
+OMS_ORDER_SYNC_ON_AUTH = os.getenv("OMS_ORDER_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
 # How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
 QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
 
@@ -137,62 +141,9 @@ job_queue = [
         }
     },
 
-    # ── Customer needed for order below (order_flow) ───────────────────────
-    {
-        "id": "job_002",
-        "client_id": "qbuser",
-        "operation": "push_customer",
-        "priority": 1,
-        "source": "order_flow",
-        "status": "pending",
-        "k365_id": "cust_order_flow_001",
-        "linked_order": "job_003",
-        "retry_count": 0,
-        "qb_id": None,
-        "payload": {
-            "name": "Kitchen365 Order Customer",
-            "company": "Order Co",
-            "first_name": "Bob",
-            "last_name": "Builder",
-            "email": "bob.builder@orderco.com",
-            "phone": "9876543212",
-            "addr1": "789 Order Street",
-            "city": "Ahmedabad",
-            "state": "GJ",
-            "postal": "380003",
-            "country": "India"
-        }
-    },
-
-    # ── Order waiting for customer above ──────────────────────────────────
-    {
-        "id": "job_003",
-        "client_id": "qbuser",
-        "operation": "push_order",
-        "priority": 2,
-        "source": "order_flow",
-        "status": "hold",           # ON HOLD until job_002 customer completes
-        "k365_id": "order_K365_1001",
-        "linked_order": None,
-        "retry_count": 0,
-        "qb_id": None,
-        "payload": {
-            "customer_name": "Kitchen365 Order Customer",
-            "txn_date": "2026-02-19",
-            "po_number": "K365-1001",
-            "lines": [
-                {
-                    "item": "Wood Door:Exterior 1122",
-                    "qty": 2,
-                    "rate": 120.00
-                }
-            ]
-        }
-    },
-
     # ── Inventory pull (scheduled) ─────────────────────────────────────────
     {
-        "id": "job_004",
+        "id": "job_002",
         "client_id": "qbuser",
         "operation": "pull_inventory",
         "priority": 4,
@@ -289,6 +240,30 @@ def _oms_customer_job_completed_for(k365_id: str) -> bool:
     return False
 
 
+def _oms_order_job_pending_for(k365_id: str) -> bool:
+    kid = str(k365_id)
+    for j in job_queue:
+        if j.get("operation") != "push_order":
+            continue
+        if str(j.get("k365_id")) != kid:
+            continue
+        if j["status"] in ("pending", "processing", "hold", "failed"):
+            return True
+    return False
+
+
+def _oms_order_job_completed_for(k365_id: str) -> bool:
+    kid = str(k365_id)
+    for j in job_queue:
+        if j.get("operation") != "push_order":
+            continue
+        if str(j.get("k365_id")) != kid:
+            continue
+        if j["status"] == "completed":
+            return True
+    return False
+
+
 async def fetch_oms_customers_page(
     client: httpx.AsyncClient, page: int
 ) -> Tuple[List, int]:
@@ -349,6 +324,222 @@ async def fetch_all_oms_customers() -> List:
             print(f"❌ OMS fetch stopped: exceeded OMS_MAX_PAGES={OMS_MAX_PAGES}")
             LOG.error("OMS customer fetch stopped: exceeded OMS_MAX_PAGES=%s", OMS_MAX_PAGES)
     return out
+
+
+def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
+    errors: List[str] = []
+
+    entity_id = order.get("entity_id")
+    increment_id = str(order.get("increment_id") or entity_id or "").strip()
+    po_number = str(order.get("increment_id") or order.get("reserved_order_id") or entity_id or "").strip()
+    txn_date = str(order.get("created_at") or "").strip()[:10]
+
+    customer_name = (
+        f"{(order.get('customer_firstname') or '').strip()} {(order.get('customer_lastname') or '').strip()}".strip()
+        or str(order.get("customer_email") or "").strip()
+        or f"Customer-{entity_id}"
+    )
+
+    if not increment_id:
+        errors.append("missing increment_id/entity_id")
+    if not txn_date:
+        errors.append("missing created_at/txn_date")
+    if not customer_name:
+        errors.append("missing customer name/email")
+
+    lines: List[dict] = []
+    for idx, line in enumerate(order.get("items") or []):
+        item_name = str(line.get("name") or line.get("sku") or "").strip()
+        qty = line.get("qty_ordered")
+        rate = line.get("price")
+        if not item_name:
+            errors.append(f"line[{idx}] missing item name/sku")
+            continue
+        try:
+            qty_num = float(qty)
+        except (TypeError, ValueError):
+            errors.append(f"line[{idx}] invalid qty_ordered={qty}")
+            continue
+        try:
+            rate_num = float(rate)
+        except (TypeError, ValueError):
+            errors.append(f"line[{idx}] invalid price={rate}")
+            continue
+        if qty_num <= 0:
+            errors.append(f"line[{idx}] qty_ordered must be > 0 (got {qty_num})")
+            continue
+        lines.append({"item": item_name, "qty": qty_num, "rate": rate_num})
+
+    if not lines:
+        errors.append("order has no valid lines")
+
+    payload = {
+        "customer_name": customer_name,
+        "txn_date": txn_date,
+        "po_number": po_number or increment_id,
+        "increment_id": increment_id,
+        "lines": lines,
+    }
+    return payload, errors
+
+
+async def fetch_oms_orders_page(
+    client: httpx.AsyncClient,
+    page: int,
+    status: str,
+    test_entity_id: Optional[str] = None,
+) -> Tuple[List, int]:
+    if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
+        raise RuntimeError("OMS_BASE_URL and OMS_ACCESS_TOKEN must be set in environment")
+
+    params = {
+        "searchCriteria[sortOrders][0][field]": "entity_id",
+        "searchCriteria[sortOrders][0][direction]": "DESC",
+        "searchCriteria[pageSize]": str(OMS_PAGE_SIZE),
+        "searchCriteria[currentPage]": str(page),
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": status,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+    }
+    if test_entity_id:
+        params["searchCriteria[filterGroups][1][filters][0][field]"] = "entity_id"
+        params["searchCriteria[filterGroups][1][filters][0][value]"] = str(test_entity_id)
+        params["searchCriteria[filterGroups][1][filters][0][conditionType]"] = "eq"
+
+    url = f"{OMS_BASE_URL}/rest/V1/orders"
+    headers = {
+        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
+        "Accept": "application/json",
+    }
+    LOG.debug("OMS GET orders page=%s query=%s", page, urlencode(params))
+    resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    items = list(data.get("items") or [])
+    total = int(data.get("total_count") or 0)
+    return items, total
+
+
+async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None) -> List:
+    if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
+        print("⚠️ OMS order fetch skipped: OMS_BASE_URL or OMS_ACCESS_TOKEN not set")
+        LOG.warning("Skipping OMS order fetch: OMS_BASE_URL or OMS_ACCESS_TOKEN not configured")
+        return []
+
+    out: List = []
+    page = 1
+    async with httpx.AsyncClient() as http_client:
+        while page <= OMS_MAX_PAGES:
+            try:
+                items, total = await fetch_oms_orders_page(http_client, page, status, test_entity_id=test_entity_id)
+            except httpx.HTTPStatusError as e:
+                print(
+                    f"❌ OMS orders HTTP error page={page} status={e.response.status_code} body={(e.response.text or '')[:200]}…"
+                )
+                LOG.error(
+                    "OMS orders HTTP error page=%s status=%s body=%s",
+                    page,
+                    e.response.status_code,
+                    (e.response.text or "")[:500],
+                )
+                raise
+            except Exception as e:
+                LOG.exception("OMS orders request failed page=%s: %s", page, e)
+                raise
+
+            out.extend(items)
+            print(f"📥 OMS orders page={page} batch={len(items)} total_so_far={len(out)} total_count={total}")
+            LOG.info("OMS orders page=%s fetched=%s total_so_far=%s total_count=%s", page, len(items), len(out), total)
+
+            if test_entity_id:
+                break
+            if not items or len(out) >= total:
+                break
+            page += 1
+        else:
+            print(f"❌ OMS order fetch stopped: exceeded OMS_MAX_PAGES={OMS_MAX_PAGES}")
+            LOG.error("OMS order fetch stopped: exceeded OMS_MAX_PAGES=%s", OMS_MAX_PAGES)
+    return out
+
+
+async def sync_orders_from_oms(client_id: str) -> dict:
+    summary: dict = {"fetched": 0, "enqueued": 0, "skipped": 0, "validation_failed": 0, "errors": []}
+    status_filter = OMS_ORDER_STATUS or "complete"
+    test_entity = OMS_ORDER_TEST_ENTITY_ID or None
+    if test_entity:
+        LOG.info("OMS order sync in test mode entity_id=%s", test_entity)
+
+    try:
+        orders = await fetch_all_oms_orders(status_filter, test_entity_id=test_entity)
+    except Exception as e:
+        summary["errors"].append(str(e))
+        print(f"❌ sync_orders_from_oms aborted: {e}")
+        LOG.error("sync_orders_from_oms aborted: %s", e)
+        return summary
+
+    summary["fetched"] = len(orders)
+    for order in orders:
+        entity_id = order.get("entity_id")
+        if entity_id is None:
+            summary["skipped"] += 1
+            LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
+            continue
+        kid = str(entity_id)
+
+        if transaction_map.get(f"order:{kid}"):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
+            continue
+        if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in job_queue", kid)
+            continue
+
+        payload, payload_errors = magento_order_to_payload(order)
+        if payload_errors:
+            summary["validation_failed"] += 1
+            LOG.error(
+                "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
+                kid,
+                payload.get("increment_id"),
+                payload_errors,
+            )
+            continue
+
+        job = {
+            "id": f"oms_order_{kid}",
+            "client_id": client_id,
+            "operation": "push_order",
+            "priority": 2,
+            "source": "oms_api",
+            "status": "pending",
+            "k365_id": kid,
+            "linked_order": None,
+            "retry_count": 0,
+            "qb_id": None,
+            "payload": payload,
+        }
+        job_queue.append(job)
+        summary["enqueued"] += 1
+        LOG.info(
+            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+            kid,
+            payload.get("po_number"),
+            payload.get("customer_name"),
+            len(payload.get("lines") or []),
+        )
+
+    print(
+        f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
+    )
+    LOG.info(
+        "OMS order sync done | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
+        summary["fetched"],
+        summary["enqueued"],
+        summary["skipped"],
+        summary["validation_failed"],
+    )
+    return summary
 
 
 async def sync_customers_from_oms(client_id: str) -> dict:
@@ -485,8 +676,28 @@ def build_customer_xml(payload: dict, request_id: str = "1") -> str:
 def build_order_xml(payload: dict, request_id: str = "1") -> str:
     lines_xml = ""
     for line in payload.get("lines", []):
-        lines_xml += f"<SalesOrderLineAdd><ItemRef><FullName>{line['item']}</FullName></ItemRef><Quantity>{line['qty']}</Quantity><Rate>{line['rate']}</Rate></SalesOrderLineAdd>"
-    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><SalesOrderAddRq requestID="{request_id}"><SalesOrderAdd><CustomerRef><FullName>{payload['customer_name']}</FullName></CustomerRef><TxnDate>{payload['txn_date']}</TxnDate><PONumber>{payload['po_number']}</PONumber>{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"""
+        item_name = _qb_text_escape(line.get("item", ""))
+        qty = line.get("qty", 0)
+        rate = line.get("rate", 0)
+        lines_xml += (
+            "<SalesOrderLineAdd>"
+            f"<ItemRef><FullName>{item_name}</FullName></ItemRef>"
+            f"<Quantity>{qty}</Quantity>"
+            f"<Rate>{rate}</Rate>"
+            "</SalesOrderLineAdd>"
+        )
+    rid = _qb_text_escape(request_id)
+    customer_name = _qb_text_escape(payload.get("customer_name", ""))
+    txn_date = _qb_text_escape(payload.get("txn_date", ""))
+    po_number = _qb_text_escape(payload.get("po_number", ""))
+    return (
+        '<?xml version="1.0" ?><?qbxml version="13.0"?>'
+        '<QBXML><QBXMLMsgsRq onError="stopOnError">'
+        f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
+        f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
+        f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
+        f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
+    )
 
 def build_inventory_xml(request_id: str = "1") -> str:
     return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="{request_id}"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq></QBXMLMsgsRq></QBXML>"""
@@ -579,6 +790,30 @@ async def api_sync_customers(request: Request):
     return summary
 
 
+@app.post("/api/sync/orders")
+async def api_sync_orders(request: Request):
+    """
+    Pull orders from OMS into the local job queue.
+    Set OMS_SYNC_API_KEY in env and send header X-Sync-Key on public hosts.
+    """
+    if OMS_SYNC_API_KEY:
+        provided = request.headers.get("X-Sync-Key") or request.headers.get("x-sync-key")
+        if provided != OMS_SYNC_API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing X-Sync-Key")
+    summary = await sync_orders_from_oms(QB_USERNAME)
+    print(
+        f"🔄 Manual /api/sync/orders | fetched={summary.get('fetched')} enqueued={summary.get('enqueued')} skipped={summary.get('skipped')} validation_failed={summary.get('validation_failed')}"
+    )
+    LOG.info(
+        "Manual /api/sync/orders | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
+        summary.get("fetched"),
+        summary.get("enqueued"),
+        summary.get("skipped"),
+        summary.get("validation_failed"),
+    )
+    return summary
+
+
 # ── Main QBWC SOAP Handler ───────────────────────────────────────────────────
 @app.post("/qbwc")
 async def qbwc_handler(request: Request):
@@ -630,6 +865,26 @@ async def qbwc_handler(request: Request):
                 except Exception as e:
                     print(f"❌ OMS customer sync on auth failed (continuing): {e}")
                     LOG.exception("OMS customer sync on auth failed (continuing with existing queue): %s", e)
+
+            if OMS_ORDER_SYNC_ON_AUTH:
+                try:
+                    oms_order_summary = await sync_orders_from_oms(u)
+                    print(
+                        f"🔄 OMS order sync on auth | fetched={oms_order_summary.get('fetched')} "
+                        f"enqueued={oms_order_summary.get('enqueued')} skipped={oms_order_summary.get('skipped')} "
+                        f"validation_failed={oms_order_summary.get('validation_failed')} errors={oms_order_summary.get('errors')}"
+                    )
+                    LOG.info(
+                        "OMS order sync on auth | fetched=%s enqueued=%s skipped=%s validation_failed=%s errors=%s",
+                        oms_order_summary.get("fetched"),
+                        oms_order_summary.get("enqueued"),
+                        oms_order_summary.get("skipped"),
+                        oms_order_summary.get("validation_failed"),
+                        oms_order_summary.get("errors"),
+                    )
+                except Exception as e:
+                    print(f"❌ OMS order sync on auth failed (continuing): {e}")
+                    LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
 
             # Load next batch of jobs for this client
             jobs = get_next_jobs_for_client(u)
@@ -720,7 +975,14 @@ async def qbwc_handler(request: Request):
             elif job["operation"] == "push_order":
                 qbxml = build_order_xml(job["payload"], request_id=job["id"])
                 print(f"🛒 Pushing order: {job['payload']['po_number']}")
-                LOG.info("Pushing order po=%s", job["payload"].get("po_number"))
+                LOG.info(
+                    "Pushing order job=%s order_id=%s po=%s customer=%s lines=%s",
+                    job["id"],
+                    job.get("k365_id"),
+                    job["payload"].get("po_number"),
+                    job["payload"].get("customer_name"),
+                    len(job["payload"].get("lines") or []),
+                )
 
             elif job["operation"] == "pull_inventory":
                 qbxml = build_inventory_xml(request_id=job["id"])
@@ -810,7 +1072,14 @@ async def qbwc_handler(request: Request):
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
                 else:
                     print(f"❌ Order push failed: {msg}")
-                    LOG.error("Order push failed job=%s message=%s", job["id"], msg)
+                    LOG.error(
+                        "Order push failed job=%s order_id=%s po=%s customer=%s message=%s",
+                        job["id"],
+                        job.get("k365_id"),
+                        job["payload"].get("po_number"),
+                        job["payload"].get("customer_name"),
+                        msg,
+                    )
                     retry = job["retry_count"] + 1
                     new_status = "dead" if retry >= 3 else "failed"
                     update_job(job["id"], status=new_status, retry_count=retry)
