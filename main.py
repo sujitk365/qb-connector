@@ -331,7 +331,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
 
     entity_id = order.get("entity_id")
     increment_id = str(order.get("increment_id") or entity_id or "").strip()
-    po_number = str(order.get("increment_id") or order.get("reserved_order_id") or entity_id or "").strip()
+    po_number = str(order.get("po_number") or order.get("reserved_order_id") or entity_id or "").strip()
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
     customer_name = (
