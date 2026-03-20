@@ -326,12 +326,48 @@ async def fetch_all_oms_customers() -> List:
     return out
 
 
+def _magento_order_po_number_only(order: dict) -> str:
+    ext = order.get("extension_attributes")
+    for key in ("purchase_order_number", "po_number"):
+        v = order.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+
+    if isinstance(ext, dict):
+        for key in ("purchase_order_number", "po_number"):
+            v = ext.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+
+    payment = order.get("payment") or {}
+    if not isinstance(payment, dict):
+        return ""
+
+    v = payment.get("po_number")
+    if v is not None and str(v).strip():
+        return str(v).strip()
+
+    method = str(payment.get("method") or "").lower()
+    add = payment.get("additional_information")
+    if isinstance(add, dict):
+        for key in ("purchase_order_number", "po_number", "po"):
+            v = add.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    elif isinstance(add, list) and method == "purchaseorder":
+        for item in add:
+            if item is not None and str(item).strip():
+                return str(item).strip()
+
+    return ""
+
+
 def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     errors: List[str] = []
 
     entity_id = order.get("entity_id")
     increment_id = str(order.get("increment_id") or entity_id or "").strip()
-    po_number = str(order.get("po_number") or order.get("reserved_order_id") or entity_id or "").strip()
+    po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
     customer_name = (
@@ -376,7 +412,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     payload = {
         "customer_name": customer_name,
         "txn_date": txn_date,
-        "po_number": po_number or increment_id,
+        "po_number": po_number,
         "increment_id": increment_id,
         "lines": lines,
     }
