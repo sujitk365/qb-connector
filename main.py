@@ -868,7 +868,7 @@ async def qbwc_handler(request: Request):
     elif "getLastError" in body_str:
         print("⚠️ getLastError called")
         LOG.warning("getLastError called")
-        xml = soap_envelope("getLastError", "<getLastErrorResult></getLastErrorResult>")
+        xml = soap_envelope("getLastError", "")
 
     # ── closeConnection ────────────────────────────────────────
     elif "closeConnection" in body_str:
