@@ -224,7 +224,7 @@ def _oms_customer_job_pending_for(k365_id: str) -> bool:
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        if j["status"] in ("pending", "processing", "hold", "failed"):
+        if j["status"] in ("pending", "processing", "hold"):
             return True
     return False
 
@@ -248,7 +248,7 @@ def _oms_order_job_pending_for(k365_id: str) -> bool:
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        if j["status"] in ("pending", "processing", "hold", "failed"):
+        if j["status"] in ("pending", "processing", "hold"):
             return True
     return False
 
@@ -698,12 +698,15 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     Respects:
     - HOLD status (order waiting for customer)
     - Priority order (1=customer_order_flow first)
-    - Only pending status
+    - pending and retryable failed status
     """
     pending = [
         j for j in job_queue
         if j["client_id"] == client_id
-        and j["status"] == "pending"
+        and (
+            j["status"] == "pending"
+            or (j["status"] == "failed" and int(j.get("retry_count", 0)) < 3)
+        )
     ]
     # Sort by priority ascending (1 = highest priority)
     pending.sort(key=lambda x: x["priority"])
