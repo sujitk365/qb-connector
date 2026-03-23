@@ -60,7 +60,6 @@ OMS_REQUEST_TIMEOUT = float(os.getenv("OMS_REQUEST_TIMEOUT", "30"))
 OMS_SYNC_ON_AUTH = os.getenv("OMS_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
 OMS_SYNC_API_KEY = (os.getenv("OMS_SYNC_API_KEY") or "").strip()
 OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
-# Default complete only; set * or all for every status; comma list = Magento "in".
 OMS_ORDER_STATUS = (os.getenv("OMS_ORDER_STATUS") or "complete").strip()
 OMS_ORDER_TEST_ENTITY_ID = (os.getenv("OMS_ORDER_TEST_ENTITY_ID") or "").strip()
 OMS_ORDER_SYNC_ON_AUTH = os.getenv("OMS_ORDER_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -224,7 +223,7 @@ def _oms_customer_job_pending_for(k365_id: str) -> bool:
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        if j["status"] in ("pending", "processing", "hold"):
+        if j["status"] in ("pending", "processing", "hold", "failed"):
             return True
     return False
 
@@ -248,7 +247,7 @@ def _oms_order_job_pending_for(k365_id: str) -> bool:
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        if j["status"] in ("pending", "processing", "hold"):
+        if j["status"] in ("pending", "processing", "hold", "failed"):
             return True
     return False
 
@@ -420,37 +419,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     return payload, errors
 
 
-def _oms_order_status_filter_params(status: str, filter_group_index: int) -> dict:
-    """Build Magento searchCriteria filter group for order status, or {} for all statuses."""
-    s = (status or "").strip()
-    if not s or s.lower() in ("*", "all"):
-        return {}
-    prefix = f"searchCriteria[filterGroups][{filter_group_index}][filters][0]"
-    if "," in s:
-        parts = [p.strip() for p in s.split(",") if p.strip()]
-        if not parts:
-            return {}
-        return {
-            f"{prefix}[field]": "status",
-            f"{prefix}[value]": ",".join(parts),
-            f"{prefix}[conditionType]": "in",
-        }
-    return {
-        f"{prefix}[field]": "status",
-        f"{prefix}[value]": s,
-        f"{prefix}[conditionType]": "eq",
-    }
-
-
-def _oms_order_entity_id_filter_params(entity_id: str, filter_group_index: int) -> dict:
-    prefix = f"searchCriteria[filterGroups][{filter_group_index}][filters][0]"
-    return {
-        f"{prefix}[field]": "entity_id",
-        f"{prefix}[value]": str(entity_id),
-        f"{prefix}[conditionType]": "eq",
-    }
-
-
 async def fetch_oms_orders_page(
     client: httpx.AsyncClient,
     page: int,
@@ -465,14 +433,14 @@ async def fetch_oms_orders_page(
         "searchCriteria[sortOrders][0][direction]": "DESC",
         "searchCriteria[pageSize]": str(OMS_PAGE_SIZE),
         "searchCriteria[currentPage]": str(page),
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": status,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
     }
-    group_idx = 0
-    status_params = _oms_order_status_filter_params(status, group_idx)
-    params.update(status_params)
-    if status_params:
-        group_idx += 1
     if test_entity_id:
-        params.update(_oms_order_entity_id_filter_params(str(test_entity_id), group_idx))
+        params["searchCriteria[filterGroups][1][filters][0][field]"] = "entity_id"
+        params["searchCriteria[filterGroups][1][filters][0][value]"] = str(test_entity_id)
+        params["searchCriteria[filterGroups][1][filters][0][conditionType]"] = "eq"
 
     url = f"{OMS_BASE_URL}/rest/V1/orders"
     headers = {
@@ -536,13 +504,6 @@ async def sync_orders_from_oms(client_id: str) -> dict:
     test_entity = OMS_ORDER_TEST_ENTITY_ID or None
     if test_entity:
         LOG.info("OMS order sync in test mode entity_id=%s", test_entity)
-    else:
-        _status_mode = (
-            "ALL_STATUSES"
-            if not _oms_order_status_filter_params(status_filter, 0)
-            else status_filter
-        )
-        LOG.info("OMS order sync status=%s", _status_mode)
 
     try:
         orders = await fetch_all_oms_orders(status_filter, test_entity_id=test_entity)
@@ -698,15 +659,12 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     Respects:
     - HOLD status (order waiting for customer)
     - Priority order (1=customer_order_flow first)
-    - pending and retryable failed status
+    - Only pending status
     """
     pending = [
         j for j in job_queue
         if j["client_id"] == client_id
-        and (
-            j["status"] == "pending"
-            or (j["status"] == "failed" and int(j.get("retry_count", 0)) < 3)
-        )
+        and j["status"] == "pending"
     ]
     # Sort by priority ascending (1 = highest priority)
     pending.sort(key=lambda x: x["priority"])
