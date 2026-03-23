@@ -63,6 +63,15 @@ OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
 OMS_ORDER_STATUS = (os.getenv("OMS_ORDER_STATUS") or "complete").strip()
 OMS_ORDER_TEST_ENTITY_ID = (os.getenv("OMS_ORDER_TEST_ENTITY_ID") or "").strip()
 OMS_ORDER_SYNC_ON_AUTH = os.getenv("OMS_ORDER_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
+# When off, skip bulk customer pull on QBWC auth (faster; use when only order sync matters).
+OMS_SYNC_CUSTOMERS_ON_AUTH = os.getenv("OMS_SYNC_CUSTOMERS_ON_AUTH", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Demo jobs (fake customer + inventory). Off by default so real orders are not delayed in Web Connector.
+QB_LOAD_SEED_JOBS = os.getenv("QB_LOAD_SEED_JOBS", "0").strip().lower() in ("1", "true", "yes", "on")
 # How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
 QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
 # Retries for QB push failures before job is marked dead.
@@ -124,49 +133,50 @@ last_inventory_pull: Optional[datetime] = None
 #   "qb_id"        : QB TxnID or ListID after success
 # }
 
-job_queue = [
-    # ── Standalone customer (no order) ────────────────────────────────────
-    {
-        "id": "job_001",
-        "client_id": "qbuser",
-        "operation": "push_customer",
-        "priority": 3,
-        "source": "customer_flow",
-        "status": "pending",
-        "k365_id": "cust_standalone_001",
-        "linked_order": None,
-        "retry_count": 0,
-        "qb_id": None,
-        "payload": {
-            "name": "Kitchen365 Standalone Customer",
-            "company": "Standalone Co",
-            "first_name": "Jane",
-            "last_name": "Doe",
-            "email": "jane.doe@standalone.com",
-            "phone": "9876543211",
-            "addr1": "456 Standalone Street",
-            "city": "Ahmedabad",
-            "state": "GJ",
-            "postal": "380002",
-            "country": "India"
-        }
-    },
-
-    # ── Inventory pull (scheduled) ─────────────────────────────────────────
-    {
-        "id": "job_002",
-        "client_id": "qbuser",
-        "operation": "pull_inventory",
-        "priority": 4,
-        "source": "scheduled",
-        "status": "pending",
-        "k365_id": None,
-        "linked_order": None,
-        "retry_count": 0,
-        "qb_id": None,
-        "payload": {}
-    }
-]
+job_queue: List[dict] = []
+if QB_LOAD_SEED_JOBS:
+    job_queue.extend(
+        [
+            {
+                "id": "job_001",
+                "client_id": "qbuser",
+                "operation": "push_customer",
+                "priority": 3,
+                "source": "customer_flow",
+                "status": "pending",
+                "k365_id": "cust_standalone_001",
+                "linked_order": None,
+                "retry_count": 0,
+                "qb_id": None,
+                "payload": {
+                    "name": "Kitchen365 Standalone Customer",
+                    "company": "Standalone Co",
+                    "first_name": "Jane",
+                    "last_name": "Doe",
+                    "email": "jane.doe@standalone.com",
+                    "phone": "9876543211",
+                    "addr1": "456 Standalone Street",
+                    "city": "Ahmedabad",
+                    "state": "GJ",
+                    "postal": "380002",
+                    "country": "India",
+                },
+            },
+            {
+                "id": "job_002",
+                "client_id": "qbuser",
+                "operation": "pull_inventory",
+                "priority": 4,
+                "source": "scheduled",
+                "status": "pending",
+                "k365_id": None,
+                "linked_order": None,
+                "retry_count": 0,
+                "qb_id": None,
+                "payload": {},
+            },
+        ]
+    )
 
 
 # ── OMS / Magento customer sync ─────────────────────────────────────────────
@@ -263,30 +273,6 @@ def _oms_customer_job_completed_for(k365_id: str) -> bool:
     kid = str(k365_id)
     for j in job_queue:
         if j.get("operation") != "push_customer":
-            continue
-        if str(j.get("k365_id")) != kid:
-            continue
-        if j["status"] == "completed":
-            return True
-    return False
-
-
-def _oms_order_job_pending_for(k365_id: str) -> bool:
-    kid = str(k365_id)
-    for j in job_queue:
-        if j.get("operation") != "push_order":
-            continue
-        if str(j.get("k365_id")) != kid:
-            continue
-        if j["status"] in ("pending", "processing", "hold", "failed"):
-            return True
-    return False
-
-
-def _oms_order_job_completed_for(k365_id: str) -> bool:
-    kid = str(k365_id)
-    for j in job_queue:
-        if j.get("operation") != "push_order":
             continue
         if str(j.get("k365_id")) != kid:
             continue
@@ -622,7 +608,14 @@ async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None
 
 
 async def sync_orders_from_oms(client_id: str) -> dict:
-    summary: dict = {"fetched": 0, "enqueued": 0, "skipped": 0, "validation_failed": 0, "errors": []}
+    summary: dict = {
+        "fetched": 0,
+        "enqueued": 0,
+        "requeued": 0,
+        "skipped": 0,
+        "validation_failed": 0,
+        "errors": [],
+    }
     status_filter = OMS_ORDER_STATUS or "complete"
     test_entity = OMS_ORDER_TEST_ENTITY_ID or None
     if test_entity:
@@ -645,15 +638,28 @@ async def sync_orders_from_oms(client_id: str) -> dict:
                 LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
                 continue
             kid = str(entity_id)
+            job_id = f"oms_order_{kid}"
 
             if transaction_map.get(f"order:{kid}"):
                 summary["skipped"] += 1
                 LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
                 continue
-            if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
-                summary["skipped"] += 1
-                LOG.debug("Skip enqueue: order %s already in job_queue", kid)
-                continue
+
+            existing = get_job(job_id)
+            if existing:
+                st = existing.get("status")
+                if st == "completed":
+                    summary["skipped"] += 1
+                    LOG.debug("Skip enqueue: order %s already completed in job_queue", kid)
+                    continue
+                if st in ("pending", "processing", "hold"):
+                    summary["skipped"] += 1
+                    LOG.debug("Skip enqueue: order %s already in flight status=%s", kid, st)
+                    continue
+                if st == "failed" and int(existing.get("retry_count", 0)) < QB_JOB_MAX_RETRIES:
+                    summary["skipped"] += 1
+                    LOG.debug("Skip enqueue: order %s failed job will retry in QBWC", kid)
+                    continue
 
             work_order = order
             if OMS_ORDER_FETCH_FULL_IF_NO_ITEMS and not (work_order.get("items") or []):
@@ -701,8 +707,40 @@ async def sync_orders_from_oms(client_id: str) -> dict:
                 )
                 continue
 
+            if existing is not None and existing.get("status") in ("dead", "failed"):
+                old_status = existing.get("status")
+                existing.update(
+                    {
+                        "client_id": client_id,
+                        "operation": "push_order",
+                        "priority": 2,
+                        "source": "oms_api",
+                        "status": "pending",
+                        "k365_id": kid,
+                        "linked_order": None,
+                        "retry_count": 0,
+                        "qb_id": None,
+                        "payload": payload,
+                    }
+                )
+                summary["requeued"] += 1
+                LOG.info(
+                    "Re-queued push_order increment_id=%s entity_id=%s po=%s lines=%s (was %s)",
+                    payload.get("increment_id"),
+                    kid,
+                    payload.get("po_number"),
+                    len(payload.get("lines") or []),
+                    old_status,
+                )
+                continue
+
+            if existing is not None:
+                summary["skipped"] += 1
+                LOG.warning("Skip enqueue: unexpected existing job %s status=%s", job_id, existing.get("status"))
+                continue
+
             job = {
-                "id": f"oms_order_{kid}",
+                "id": job_id,
                 "client_id": client_id,
                 "operation": "push_order",
                 "priority": 2,
@@ -717,7 +755,8 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             job_queue.append(job)
             summary["enqueued"] += 1
             LOG.info(
-                "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+                "Enqueued push_order increment_id=%s entity_id=%s po=%s customer=%s lines=%s",
+                payload.get("increment_id"),
                 kid,
                 payload.get("po_number"),
                 payload.get("customer_name"),
@@ -725,12 +764,14 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             )
 
     print(
-        f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
+        f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} "
+        f"requeued={summary['requeued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
     )
     LOG.info(
-        "OMS order sync done | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
+        "OMS order sync done | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s",
         summary["fetched"],
         summary["enqueued"],
+        summary["requeued"],
         summary["skipped"],
         summary["validation_failed"],
     )
@@ -803,6 +844,21 @@ async def sync_customers_from_oms(client_id: str) -> dict:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+def reset_stale_processing_jobs(client_id: str) -> int:
+    """
+    If Web Connector disconnects mid-run, jobs stay 'processing' and are never picked again.
+    Reset them to pending so the next session can finish.
+    """
+    n = 0
+    for j in job_queue:
+        if j.get("client_id") == client_id and j.get("status") == "processing":
+            j["status"] = "pending"
+            n += 1
+    if n:
+        LOG.warning("Reset %s stale processing jobs for client_id=%s", n, client_id)
+    return n
+
 
 def get_job(job_id: str):
     return next((j for j in job_queue if j["id"] == job_id), None)
@@ -1013,12 +1069,14 @@ async def api_sync_orders(request: Request):
             raise HTTPException(status_code=401, detail="Invalid or missing X-Sync-Key")
     summary = await sync_orders_from_oms(QB_USERNAME)
     print(
-        f"🔄 Manual /api/sync/orders | fetched={summary.get('fetched')} enqueued={summary.get('enqueued')} skipped={summary.get('skipped')} validation_failed={summary.get('validation_failed')}"
+        f"🔄 Manual /api/sync/orders | fetched={summary.get('fetched')} enqueued={summary.get('enqueued')} "
+        f"requeued={summary.get('requeued')} skipped={summary.get('skipped')} validation_failed={summary.get('validation_failed')}"
     )
     LOG.info(
-        "Manual /api/sync/orders | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
+        "Manual /api/sync/orders | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s",
         summary.get("fetched"),
         summary.get("enqueued"),
+        summary.get("requeued"),
         summary.get("skipped"),
         summary.get("validation_failed"),
     )
@@ -1058,11 +1116,36 @@ async def qbwc_handler(request: Request):
         if u == QB_USERNAME and p == QB_PASSWORD:
             ticket = str(uuid.uuid4())
 
-            if OMS_SYNC_ON_AUTH:
+            reset_stale_processing_jobs(u)
+
+            # Orders first so they are queued even if customer sync is slow; matches "newest complete" priority.
+            if OMS_ORDER_SYNC_ON_AUTH:
+                try:
+                    oms_order_summary = await sync_orders_from_oms(u)
+                    print(
+                        f"🔄 OMS order sync on auth | fetched={oms_order_summary.get('fetched')} "
+                        f"enqueued={oms_order_summary.get('enqueued')} requeued={oms_order_summary.get('requeued')} "
+                        f"skipped={oms_order_summary.get('skipped')} "
+                        f"validation_failed={oms_order_summary.get('validation_failed')} errors={oms_order_summary.get('errors')}"
+                    )
+                    LOG.info(
+                        "OMS order sync on auth | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s errors=%s",
+                        oms_order_summary.get("fetched"),
+                        oms_order_summary.get("enqueued"),
+                        oms_order_summary.get("requeued"),
+                        oms_order_summary.get("skipped"),
+                        oms_order_summary.get("validation_failed"),
+                        oms_order_summary.get("errors"),
+                    )
+                except Exception as e:
+                    print(f"❌ OMS order sync on auth failed (continuing): {e}")
+                    LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
+
+            if OMS_SYNC_ON_AUTH and OMS_SYNC_CUSTOMERS_ON_AUTH:
                 try:
                     oms_summary = await sync_customers_from_oms(u)
                     print(
-                        f"🔄 OMS sync on auth | fetched={oms_summary.get('fetched')} "
+                        f"🔄 OMS customer sync on auth | fetched={oms_summary.get('fetched')} "
                         f"enqueued={oms_summary.get('enqueued')} skipped={oms_summary.get('skipped')} "
                         f"errors={oms_summary.get('errors')}"
                     )
@@ -1076,26 +1159,6 @@ async def qbwc_handler(request: Request):
                 except Exception as e:
                     print(f"❌ OMS customer sync on auth failed (continuing): {e}")
                     LOG.exception("OMS customer sync on auth failed (continuing with existing queue): %s", e)
-
-            if OMS_ORDER_SYNC_ON_AUTH:
-                try:
-                    oms_order_summary = await sync_orders_from_oms(u)
-                    print(
-                        f"🔄 OMS order sync on auth | fetched={oms_order_summary.get('fetched')} "
-                        f"enqueued={oms_order_summary.get('enqueued')} skipped={oms_order_summary.get('skipped')} "
-                        f"validation_failed={oms_order_summary.get('validation_failed')} errors={oms_order_summary.get('errors')}"
-                    )
-                    LOG.info(
-                        "OMS order sync on auth | fetched=%s enqueued=%s skipped=%s validation_failed=%s errors=%s",
-                        oms_order_summary.get("fetched"),
-                        oms_order_summary.get("enqueued"),
-                        oms_order_summary.get("skipped"),
-                        oms_order_summary.get("validation_failed"),
-                        oms_order_summary.get("errors"),
-                    )
-                except Exception as e:
-                    print(f"❌ OMS order sync on auth failed (continuing): {e}")
-                    LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
 
             # Load next batch of jobs for this client
             jobs = get_next_jobs_for_client(u)
