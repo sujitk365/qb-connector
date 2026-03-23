@@ -63,28 +63,8 @@ OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
 OMS_ORDER_STATUS = (os.getenv("OMS_ORDER_STATUS") or "complete").strip()
 OMS_ORDER_TEST_ENTITY_ID = (os.getenv("OMS_ORDER_TEST_ENTITY_ID") or "").strip()
 OMS_ORDER_SYNC_ON_AUTH = os.getenv("OMS_ORDER_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
-# When off, skip bulk customer pull on QBWC auth (faster; use when only order sync matters).
-OMS_SYNC_CUSTOMERS_ON_AUTH = os.getenv("OMS_SYNC_CUSTOMERS_ON_AUTH", "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-# Demo jobs (fake customer + inventory). Off by default so real orders are not delayed in Web Connector.
-QB_LOAD_SEED_JOBS = os.getenv("QB_LOAD_SEED_JOBS", "0").strip().lower() in ("1", "true", "yes", "on")
 # How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
 QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
-# Retries for QB push failures before job is marked dead.
-QB_JOB_MAX_RETRIES = max(1, min(20, int(os.getenv("QB_JOB_MAX_RETRIES", "5"))))
-# If order list API returns no items, GET /orders/:id (full order usually includes items).
-OMS_ORDER_FETCH_FULL_IF_NO_ITEMS = os.getenv("OMS_ORDER_FETCH_FULL_IF_NO_ITEMS", "1").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
-# QuickBooks ItemRef: sku (default, matches most QB item lists) or name.
-QB_ORDER_LINE_REF = (os.getenv("QB_ORDER_LINE_REF") or "sku").strip().lower()
 
 
 @asynccontextmanager
@@ -133,50 +113,49 @@ last_inventory_pull: Optional[datetime] = None
 #   "qb_id"        : QB TxnID or ListID after success
 # }
 
-job_queue: List[dict] = []
-if QB_LOAD_SEED_JOBS:
-    job_queue.extend(
-        [
-            {
-                "id": "job_001",
-                "client_id": "qbuser",
-                "operation": "push_customer",
-                "priority": 3,
-                "source": "customer_flow",
-                "status": "pending",
-                "k365_id": "cust_standalone_001",
-                "linked_order": None,
-                "retry_count": 0,
-                "qb_id": None,
-                "payload": {
-                    "name": "Kitchen365 Standalone Customer",
-                    "company": "Standalone Co",
-                    "first_name": "Jane",
-                    "last_name": "Doe",
-                    "email": "jane.doe@standalone.com",
-                    "phone": "9876543211",
-                    "addr1": "456 Standalone Street",
-                    "city": "Ahmedabad",
-                    "state": "GJ",
-                    "postal": "380002",
-                    "country": "India",
-                },
-            },
-            {
-                "id": "job_002",
-                "client_id": "qbuser",
-                "operation": "pull_inventory",
-                "priority": 4,
-                "source": "scheduled",
-                "status": "pending",
-                "k365_id": None,
-                "linked_order": None,
-                "retry_count": 0,
-                "qb_id": None,
-                "payload": {},
-            },
-        ]
-    )
+job_queue = [
+    # ── Standalone customer (no order) ────────────────────────────────────
+    {
+        "id": "job_001",
+        "client_id": "qbuser",
+        "operation": "push_customer",
+        "priority": 3,
+        "source": "customer_flow",
+        "status": "pending",
+        "k365_id": "cust_standalone_001",
+        "linked_order": None,
+        "retry_count": 0,
+        "qb_id": None,
+        "payload": {
+            "name": "Kitchen365 Standalone Customer",
+            "company": "Standalone Co",
+            "first_name": "Jane",
+            "last_name": "Doe",
+            "email": "jane.doe@standalone.com",
+            "phone": "9876543211",
+            "addr1": "456 Standalone Street",
+            "city": "Ahmedabad",
+            "state": "GJ",
+            "postal": "380002",
+            "country": "India"
+        }
+    },
+
+    # ── Inventory pull (scheduled) ─────────────────────────────────────────
+    {
+        "id": "job_002",
+        "client_id": "qbuser",
+        "operation": "pull_inventory",
+        "priority": 4,
+        "source": "scheduled",
+        "status": "pending",
+        "k365_id": None,
+        "linked_order": None,
+        "retry_count": 0,
+        "qb_id": None,
+        "payload": {}
+    }
+]
 
 
 # ── OMS / Magento customer sync ─────────────────────────────────────────────
@@ -184,27 +163,6 @@ if QB_LOAD_SEED_JOBS:
 def _qb_text_escape(value: Any) -> str:
     """Escape text for QBXML character data."""
     return xml_escape(str(value if value is not None else ""), entities={'"': "&quot;", "'": "&apos;"})
-
-
-def _qb_customer_display_name(
-    *,
-    company: str = "",
-    first: str = "",
-    last: str = "",
-    email: str = "",
-    fallback_id: Any = None,
-) -> str:
-    """Must match CustomerAdd Name so SalesOrderAdd CustomerRef resolves for existing customers."""
-    co = (company or "").strip()
-    fn = (first or "").strip()
-    ln = (last or "").strip()
-    em = (email or "").strip()
-    display = co or f"{fn} {ln}".strip() or em
-    if not display and fallback_id is not None:
-        display = f"Customer-{fallback_id}"
-    if len(display) > 41:
-        display = display[:38] + "..."
-    return display
 
 
 def magento_customer_to_payload(customer: dict) -> dict:
@@ -238,9 +196,10 @@ def magento_customer_to_payload(customer: dict) -> dict:
     country = (addr.get("country_id") or "").strip()
     phone = (addr.get("telephone") or "").strip()
 
-    display = _qb_customer_display_name(
-        company=company, first=first, last=last, email=email, fallback_id=cid
-    )
+    display = company or f"{first} {last}".strip() or email or f"Customer-{cid}"
+    # QuickBooks display name practical limit
+    if len(display) > 41:
+        display = display[:38] + "..."
 
     return {
         "name": display,
@@ -273,6 +232,30 @@ def _oms_customer_job_completed_for(k365_id: str) -> bool:
     kid = str(k365_id)
     for j in job_queue:
         if j.get("operation") != "push_customer":
+            continue
+        if str(j.get("k365_id")) != kid:
+            continue
+        if j["status"] == "completed":
+            return True
+    return False
+
+
+def _oms_order_job_pending_for(k365_id: str) -> bool:
+    kid = str(k365_id)
+    for j in job_queue:
+        if j.get("operation") != "push_order":
+            continue
+        if str(j.get("k365_id")) != kid:
+            continue
+        if j["status"] in ("pending", "processing", "hold", "failed"):
+            return True
+    return False
+
+
+def _oms_order_job_completed_for(k365_id: str) -> bool:
+    kid = str(k365_id)
+    for j in job_queue:
+        if j.get("operation") != "push_order":
             continue
         if str(j.get("k365_id")) != kid:
             continue
@@ -379,69 +362,18 @@ def _magento_order_po_number_only(order: dict) -> str:
     return ""
 
 
-def _magento_order_company(order: dict) -> str:
-    ext = order.get("extension_attributes")
-    if isinstance(ext, dict):
-        for key in ("company", "customer_company", "customer_company_name"):
-            v = ext.get(key)
-            if v is not None and str(v).strip():
-                return str(v).strip()
-    ba = order.get("billing_address")
-    if isinstance(ba, dict):
-        v = ba.get("company")
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    v = order.get("customer_company")
-    if v is not None and str(v).strip():
-        return str(v).strip()
-    return ""
-
-
-def _magento_order_line_item_ref(line: dict) -> str:
-    sku = str(line.get("sku") or "").strip()
-    name = str(line.get("name") or "").strip()
-    if QB_ORDER_LINE_REF == "name":
-        return name or sku
-    return sku or name
-
-
-def _magento_order_line_unit_price(line: dict, qty: float) -> Optional[float]:
-    for key in ("price", "base_price"):
-        raw = line.get(key)
-        if raw is None:
-            continue
-        try:
-            return float(raw)
-        except (TypeError, ValueError):
-            continue
-    if qty > 0:
-        for key in ("row_total", "base_row_total"):
-            raw = line.get(key)
-            if raw is None:
-                continue
-            try:
-                return float(raw) / qty
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
 def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     errors: List[str] = []
 
     entity_id = order.get("entity_id")
     increment_id = str(order.get("increment_id") or entity_id or "").strip()
-    po_raw = _magento_order_po_number_only(order)
-    # PO: use increment when empty so QB is less likely to collide on blank PONumber.
-    po_number = po_raw or increment_id
+    po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
-    first = (order.get("customer_firstname") or "").strip()
-    last = (order.get("customer_lastname") or "").strip()
-    email = str(order.get("customer_email") or "").strip()
-    company = _magento_order_company(order)
-    customer_name = _qb_customer_display_name(
-        company=company, first=first, last=last, email=email, fallback_id=entity_id
+    customer_name = (
+        f"{(order.get('customer_firstname') or '').strip()} {(order.get('customer_lastname') or '').strip()}".strip()
+        or str(order.get("customer_email") or "").strip()
+        or f"Customer-{entity_id}"
     )
 
     if not increment_id:
@@ -453,10 +385,9 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
 
     lines: List[dict] = []
     for idx, line in enumerate(order.get("items") or []):
-        if line.get("parent_item_id") is not None:
-            continue
-        item_name = _magento_order_line_item_ref(line)
+        item_name = str(line.get("name") or line.get("sku") or "").strip()
         qty = line.get("qty_ordered")
+        rate = line.get("price")
         if not item_name:
             errors.append(f"line[{idx}] missing item name/sku")
             continue
@@ -465,11 +396,13 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         except (TypeError, ValueError):
             errors.append(f"line[{idx}] invalid qty_ordered={qty}")
             continue
-        if qty_num <= 0:
+        try:
+            rate_num = float(rate)
+        except (TypeError, ValueError):
+            errors.append(f"line[{idx}] invalid price={rate}")
             continue
-        rate_num = _magento_order_line_unit_price(line, qty_num)
-        if rate_num is None:
-            errors.append(f"line[{idx}] could not determine unit price (sku={line.get('sku')})")
+        if qty_num <= 0:
+            errors.append(f"line[{idx}] qty_ordered must be > 0 (got {qty_num})")
             continue
         lines.append({"item": item_name, "qty": qty_num, "rate": rate_num})
 
@@ -495,39 +428,19 @@ async def fetch_oms_orders_page(
     if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
         raise RuntimeError("OMS_BASE_URL and OMS_ACCESS_TOKEN must be set in environment")
 
-    # Match Magento REST pattern: latest by created_at first (then entity_id), same as
-    # .../orders?searchCriteria[sortOrders][0][field]=created_at&...=DESC
     params = {
-        "searchCriteria[sortOrders][0][field]": "created_at",
+        "searchCriteria[sortOrders][0][field]": "entity_id",
         "searchCriteria[sortOrders][0][direction]": "DESC",
-        "searchCriteria[sortOrders][1][field]": "entity_id",
-        "searchCriteria[sortOrders][1][direction]": "DESC",
         "searchCriteria[pageSize]": str(OMS_PAGE_SIZE),
         "searchCriteria[currentPage]": str(page),
+        "searchCriteria[filterGroups][0][filters][0][field]": "status",
+        "searchCriteria[filterGroups][0][filters][0][value]": status,
+        "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
     }
-    # Filter groups: when testing one order, entity_id is group 0 and status is group 1
-    # (matches .../filterGroups][1][...]status... style). Otherwise status alone is group 0.
-    filter_groups: List[dict] = []
     if test_entity_id:
-        filter_groups.append(
-            {
-                "field": "entity_id",
-                "value": str(test_entity_id),
-                "conditionType": "eq",
-            }
-        )
-    filter_groups.append(
-        {
-            "field": "status",
-            "value": status,
-            "conditionType": "eq",
-        }
-    )
-    for gi, fg in enumerate(filter_groups):
-        prefix = f"searchCriteria[filterGroups][{gi}][filters][0]"
-        params[f"{prefix}[field]"] = fg["field"]
-        params[f"{prefix}[value]"] = fg["value"]
-        params[f"{prefix}[conditionType]"] = fg["conditionType"]
+        params["searchCriteria[filterGroups][1][filters][0][field]"] = "entity_id"
+        params["searchCriteria[filterGroups][1][filters][0][value]"] = str(test_entity_id)
+        params["searchCriteria[filterGroups][1][filters][0][conditionType]"] = "eq"
 
     url = f"{OMS_BASE_URL}/rest/V1/orders"
     headers = {
@@ -541,28 +454,6 @@ async def fetch_oms_orders_page(
     items = list(data.get("items") or [])
     total = int(data.get("total_count") or 0)
     return items, total
-
-
-async def fetch_oms_order_by_id(client: httpx.AsyncClient, entity_id: Any) -> Optional[dict]:
-    """Load a single order (items are often only present on GET by id, not on search list)."""
-    if entity_id is None:
-        return None
-    if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
-        return None
-    try:
-        oid = int(entity_id)
-    except (TypeError, ValueError):
-        return None
-    url = f"{OMS_BASE_URL}/rest/V1/orders/{oid}"
-    headers = {
-        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
-        "Accept": "application/json",
-    }
-    LOG.debug("OMS GET order by id=%s", oid)
-    resp = await client.get(url, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    return data if isinstance(data, dict) else None
 
 
 async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None) -> List:
@@ -608,14 +499,7 @@ async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None
 
 
 async def sync_orders_from_oms(client_id: str) -> dict:
-    summary: dict = {
-        "fetched": 0,
-        "enqueued": 0,
-        "requeued": 0,
-        "skipped": 0,
-        "validation_failed": 0,
-        "errors": [],
-    }
+    summary: dict = {"fetched": 0, "enqueued": 0, "skipped": 0, "validation_failed": 0, "errors": []}
     status_filter = OMS_ORDER_STATUS or "complete"
     test_entity = OMS_ORDER_TEST_ENTITY_ID or None
     if test_entity:
@@ -630,148 +514,64 @@ async def sync_orders_from_oms(client_id: str) -> dict:
         return summary
 
     summary["fetched"] = len(orders)
-    async with httpx.AsyncClient() as http_client:
-        for i, order in enumerate(orders):
-            entity_id = order.get("entity_id")
-            if entity_id is None:
-                summary["skipped"] += 1
-                LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
-                continue
-            kid = str(entity_id)
-            job_id = f"oms_order_{kid}"
+    for order in orders:
+        entity_id = order.get("entity_id")
+        if entity_id is None:
+            summary["skipped"] += 1
+            LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
+            continue
+        kid = str(entity_id)
 
-            if transaction_map.get(f"order:{kid}"):
-                summary["skipped"] += 1
-                LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
-                continue
+        if transaction_map.get(f"order:{kid}"):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
+            continue
+        if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in job_queue", kid)
+            continue
 
-            existing = get_job(job_id)
-            if existing:
-                st = existing.get("status")
-                if st == "completed":
-                    summary["skipped"] += 1
-                    LOG.debug("Skip enqueue: order %s already completed in job_queue", kid)
-                    continue
-                if st in ("pending", "processing", "hold"):
-                    summary["skipped"] += 1
-                    LOG.debug("Skip enqueue: order %s already in flight status=%s", kid, st)
-                    continue
-                if st == "failed" and int(existing.get("retry_count", 0)) < QB_JOB_MAX_RETRIES:
-                    summary["skipped"] += 1
-                    LOG.debug("Skip enqueue: order %s failed job will retry in QBWC", kid)
-                    continue
-
-            work_order = order
-            if OMS_ORDER_FETCH_FULL_IF_NO_ITEMS and not (work_order.get("items") or []):
-                try:
-                    full = await fetch_oms_order_by_id(http_client, entity_id)
-                except httpx.HTTPStatusError as e:
-                    summary["validation_failed"] += 1
-                    LOG.error(
-                        "OMS full order fetch failed entity_id=%s status=%s body=%s",
-                        kid,
-                        e.response.status_code,
-                        (e.response.text or "")[:500],
-                    )
-                    continue
-                except Exception as e:
-                    summary["validation_failed"] += 1
-                    LOG.exception("OMS full order fetch failed entity_id=%s: %s", kid, e)
-                    continue
-                if full:
-                    work_order = full
-                    orders[i] = full
-
-            payload, payload_errors = magento_order_to_payload(work_order)
-            if (
-                payload_errors
-                and "order has no valid lines" in payload_errors
-                and OMS_ORDER_FETCH_FULL_IF_NO_ITEMS
-            ):
-                try:
-                    full2 = await fetch_oms_order_by_id(http_client, entity_id)
-                except Exception as e:
-                    full2 = None
-                    LOG.warning("OMS second full order fetch entity_id=%s: %s", kid, e)
-                if full2:
-                    work_order = full2
-                    orders[i] = full2
-                    payload, payload_errors = magento_order_to_payload(work_order)
-            if payload_errors:
-                summary["validation_failed"] += 1
-                LOG.error(
-                    "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
-                    kid,
-                    payload.get("increment_id"),
-                    payload_errors,
-                )
-                continue
-
-            if existing is not None and existing.get("status") in ("dead", "failed"):
-                old_status = existing.get("status")
-                existing.update(
-                    {
-                        "client_id": client_id,
-                        "operation": "push_order",
-                        "priority": 2,
-                        "source": "oms_api",
-                        "status": "pending",
-                        "k365_id": kid,
-                        "linked_order": None,
-                        "retry_count": 0,
-                        "qb_id": None,
-                        "payload": payload,
-                    }
-                )
-                summary["requeued"] += 1
-                LOG.info(
-                    "Re-queued push_order increment_id=%s entity_id=%s po=%s lines=%s (was %s)",
-                    payload.get("increment_id"),
-                    kid,
-                    payload.get("po_number"),
-                    len(payload.get("lines") or []),
-                    old_status,
-                )
-                continue
-
-            if existing is not None:
-                summary["skipped"] += 1
-                LOG.warning("Skip enqueue: unexpected existing job %s status=%s", job_id, existing.get("status"))
-                continue
-
-            job = {
-                "id": job_id,
-                "client_id": client_id,
-                "operation": "push_order",
-                "priority": 2,
-                "source": "oms_api",
-                "status": "pending",
-                "k365_id": kid,
-                "linked_order": None,
-                "retry_count": 0,
-                "qb_id": None,
-                "payload": payload,
-            }
-            job_queue.append(job)
-            summary["enqueued"] += 1
-            LOG.info(
-                "Enqueued push_order increment_id=%s entity_id=%s po=%s customer=%s lines=%s",
-                payload.get("increment_id"),
+        payload, payload_errors = magento_order_to_payload(order)
+        if payload_errors:
+            summary["validation_failed"] += 1
+            LOG.error(
+                "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
                 kid,
-                payload.get("po_number"),
-                payload.get("customer_name"),
-                len(payload.get("lines") or []),
+                payload.get("increment_id"),
+                payload_errors,
             )
+            continue
+
+        job = {
+            "id": f"oms_order_{kid}",
+            "client_id": client_id,
+            "operation": "push_order",
+            "priority": 2,
+            "source": "oms_api",
+            "status": "pending",
+            "k365_id": kid,
+            "linked_order": None,
+            "retry_count": 0,
+            "qb_id": None,
+            "payload": payload,
+        }
+        job_queue.append(job)
+        summary["enqueued"] += 1
+        LOG.info(
+            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+            kid,
+            payload.get("po_number"),
+            payload.get("customer_name"),
+            len(payload.get("lines") or []),
+        )
 
     print(
-        f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} "
-        f"requeued={summary['requeued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
+        f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
     )
     LOG.info(
-        "OMS order sync done | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s",
+        "OMS order sync done | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
         summary["fetched"],
         summary["enqueued"],
-        summary["requeued"],
         summary["skipped"],
         summary["validation_failed"],
     )
@@ -845,21 +645,6 @@ async def sync_customers_from_oms(client_id: str) -> dict:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-def reset_stale_processing_jobs(client_id: str) -> int:
-    """
-    If Web Connector disconnects mid-run, jobs stay 'processing' and are never picked again.
-    Reset them to pending so the next session can finish.
-    """
-    n = 0
-    for j in job_queue:
-        if j.get("client_id") == client_id and j.get("status") == "processing":
-            j["status"] = "pending"
-            n += 1
-    if n:
-        LOG.warning("Reset %s stale processing jobs for client_id=%s", n, client_id)
-    return n
-
-
 def get_job(job_id: str):
     return next((j for j in job_queue if j["id"] == job_id), None)
 
@@ -874,31 +659,15 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     Respects:
     - HOLD status (order waiting for customer)
     - Priority order (1=customer_order_flow first)
-    - pending and retryable failed jobs
-    - push_order: newest entity_id first; pending before failed
+    - Only pending status
     """
     pending = [
         j for j in job_queue
         if j["client_id"] == client_id
-        and (
-            j["status"] == "pending"
-            or (j["status"] == "failed" and int(j.get("retry_count", 0)) < QB_JOB_MAX_RETRIES)
-        )
+        and j["status"] == "pending"
     ]
-
-    def _job_sort_key(job: dict):
-        pr = int(job.get("priority", 99))
-        st = job.get("status") or ""
-        status_rank = 0 if st == "pending" else 1
-        order_rank = 0
-        if job.get("operation") == "push_order":
-            try:
-                order_rank = -int(str(job.get("k365_id") or "0"))
-            except (TypeError, ValueError):
-                order_rank = 0
-        return (pr, status_rank, order_rank)
-
-    pending.sort(key=_job_sort_key)
+    # Sort by priority ascending (1 = highest priority)
+    pending.sort(key=lambda x: x["priority"])
     limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
     return pending[:limit]
 
@@ -1069,14 +838,12 @@ async def api_sync_orders(request: Request):
             raise HTTPException(status_code=401, detail="Invalid or missing X-Sync-Key")
     summary = await sync_orders_from_oms(QB_USERNAME)
     print(
-        f"🔄 Manual /api/sync/orders | fetched={summary.get('fetched')} enqueued={summary.get('enqueued')} "
-        f"requeued={summary.get('requeued')} skipped={summary.get('skipped')} validation_failed={summary.get('validation_failed')}"
+        f"🔄 Manual /api/sync/orders | fetched={summary.get('fetched')} enqueued={summary.get('enqueued')} skipped={summary.get('skipped')} validation_failed={summary.get('validation_failed')}"
     )
     LOG.info(
-        "Manual /api/sync/orders | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s",
+        "Manual /api/sync/orders | fetched=%s enqueued=%s skipped=%s validation_failed=%s",
         summary.get("fetched"),
         summary.get("enqueued"),
-        summary.get("requeued"),
         summary.get("skipped"),
         summary.get("validation_failed"),
     )
@@ -1116,36 +883,11 @@ async def qbwc_handler(request: Request):
         if u == QB_USERNAME and p == QB_PASSWORD:
             ticket = str(uuid.uuid4())
 
-            reset_stale_processing_jobs(u)
-
-            # Orders first so they are queued even if customer sync is slow; matches "newest complete" priority.
-            if OMS_ORDER_SYNC_ON_AUTH:
-                try:
-                    oms_order_summary = await sync_orders_from_oms(u)
-                    print(
-                        f"🔄 OMS order sync on auth | fetched={oms_order_summary.get('fetched')} "
-                        f"enqueued={oms_order_summary.get('enqueued')} requeued={oms_order_summary.get('requeued')} "
-                        f"skipped={oms_order_summary.get('skipped')} "
-                        f"validation_failed={oms_order_summary.get('validation_failed')} errors={oms_order_summary.get('errors')}"
-                    )
-                    LOG.info(
-                        "OMS order sync on auth | fetched=%s enqueued=%s requeued=%s skipped=%s validation_failed=%s errors=%s",
-                        oms_order_summary.get("fetched"),
-                        oms_order_summary.get("enqueued"),
-                        oms_order_summary.get("requeued"),
-                        oms_order_summary.get("skipped"),
-                        oms_order_summary.get("validation_failed"),
-                        oms_order_summary.get("errors"),
-                    )
-                except Exception as e:
-                    print(f"❌ OMS order sync on auth failed (continuing): {e}")
-                    LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
-
-            if OMS_SYNC_ON_AUTH and OMS_SYNC_CUSTOMERS_ON_AUTH:
+            if OMS_SYNC_ON_AUTH:
                 try:
                     oms_summary = await sync_customers_from_oms(u)
                     print(
-                        f"🔄 OMS customer sync on auth | fetched={oms_summary.get('fetched')} "
+                        f"🔄 OMS sync on auth | fetched={oms_summary.get('fetched')} "
                         f"enqueued={oms_summary.get('enqueued')} skipped={oms_summary.get('skipped')} "
                         f"errors={oms_summary.get('errors')}"
                     )
@@ -1159,6 +901,26 @@ async def qbwc_handler(request: Request):
                 except Exception as e:
                     print(f"❌ OMS customer sync on auth failed (continuing): {e}")
                     LOG.exception("OMS customer sync on auth failed (continuing with existing queue): %s", e)
+
+            if OMS_ORDER_SYNC_ON_AUTH:
+                try:
+                    oms_order_summary = await sync_orders_from_oms(u)
+                    print(
+                        f"🔄 OMS order sync on auth | fetched={oms_order_summary.get('fetched')} "
+                        f"enqueued={oms_order_summary.get('enqueued')} skipped={oms_order_summary.get('skipped')} "
+                        f"validation_failed={oms_order_summary.get('validation_failed')} errors={oms_order_summary.get('errors')}"
+                    )
+                    LOG.info(
+                        "OMS order sync on auth | fetched=%s enqueued=%s skipped=%s validation_failed=%s errors=%s",
+                        oms_order_summary.get("fetched"),
+                        oms_order_summary.get("enqueued"),
+                        oms_order_summary.get("skipped"),
+                        oms_order_summary.get("validation_failed"),
+                        oms_order_summary.get("errors"),
+                    )
+                except Exception as e:
+                    print(f"❌ OMS order sync on auth failed (continuing): {e}")
+                    LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
 
             # Load next batch of jobs for this client
             jobs = get_next_jobs_for_client(u)
@@ -1330,7 +1092,7 @@ async def qbwc_handler(request: Request):
                     print(f"❌ Customer push failed: {msg}")
                     LOG.error("Customer push failed job=%s message=%s", job["id"], msg)
                     retry = job["retry_count"] + 1
-                    new_status = "dead" if retry >= QB_JOB_MAX_RETRIES else "failed"
+                    new_status = "dead" if retry >= 3 else "failed"
                     update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "push_order":
@@ -1355,7 +1117,7 @@ async def qbwc_handler(request: Request):
                         msg,
                     )
                     retry = job["retry_count"] + 1
-                    new_status = "dead" if retry >= QB_JOB_MAX_RETRIES else "failed"
+                    new_status = "dead" if retry >= 3 else "failed"
                     update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "pull_inventory":
