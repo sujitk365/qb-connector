@@ -63,6 +63,11 @@ OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
 OMS_ORDER_STATUS = (os.getenv("OMS_ORDER_STATUS") or "complete").strip()
 OMS_ORDER_TEST_ENTITY_ID = (os.getenv("OMS_ORDER_TEST_ENTITY_ID") or "").strip()
 OMS_ORDER_SYNC_ON_AUTH = os.getenv("OMS_ORDER_SYNC_ON_AUTH", "1").strip().lower() in ("1", "true", "yes", "on")
+# Latest-first: entity_id DESC matches newest Magento orders in typical stores; override with e.g. created_at + DESC.
+OMS_ORDER_SORT_FIELD = (os.getenv("OMS_ORDER_SORT_FIELD") or "entity_id").strip()
+OMS_ORDER_SORT_DIRECTION = (os.getenv("OMS_ORDER_SORT_DIRECTION") or "DESC").strip().upper()
+if OMS_ORDER_SORT_DIRECTION not in ("ASC", "DESC"):
+    OMS_ORDER_SORT_DIRECTION = "DESC"
 # How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
 QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
 
@@ -426,21 +431,22 @@ async def fetch_oms_orders_page(
     test_entity_id: Optional[str] = None,
 ) -> Tuple[List, int]:
     """
-    One page of GET /rest/V1/orders. Magento uses 1-based searchCriteria[currentPage]
-    and searchCriteria[pageSize] (from OMS_PAGE_SIZE, max 500).
+    One page of GET /rest/V1/orders. Same searchCriteria shape as:
+    /rest/V1/orders?searchCriteria[filterGroups][0]...&searchCriteria[sortOrders][0]...
+    Latest orders first: default sort entity_id DESC (set OMS_ORDER_SORT_FIELD / OMS_ORDER_SORT_DIRECTION).
     """
     if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
         raise RuntimeError("OMS_BASE_URL and OMS_ACCESS_TOKEN must be set in environment")
 
-    # Dynamic pagination: pageSize from env, currentPage = 1,2,... in fetch_all_oms_orders
+    # Param order matches typical Magento REST URLs (filters, sort, then paging).
     params = {
-        "searchCriteria[sortOrders][0][field]": "entity_id",
-        "searchCriteria[sortOrders][0][direction]": "DESC",
-        "searchCriteria[pageSize]": str(OMS_PAGE_SIZE),
-        "searchCriteria[currentPage]": str(page),
         "searchCriteria[filterGroups][0][filters][0][field]": "status",
         "searchCriteria[filterGroups][0][filters][0][value]": status,
         "searchCriteria[filterGroups][0][filters][0][conditionType]": "eq",
+        "searchCriteria[sortOrders][0][field]": OMS_ORDER_SORT_FIELD,
+        "searchCriteria[sortOrders][0][direction]": OMS_ORDER_SORT_DIRECTION,
+        "searchCriteria[pageSize]": str(OMS_PAGE_SIZE),
+        "searchCriteria[currentPage]": str(page),
     }
     if test_entity_id:
         params["searchCriteria[filterGroups][1][filters][0][field]"] = "entity_id"
@@ -453,10 +459,12 @@ async def fetch_oms_orders_page(
         "Accept": "application/json",
     }
     LOG.debug(
-        "OMS GET orders currentPage=%s pageSize=%s status=%s query=%s",
+        "OMS GET orders currentPage=%s pageSize=%s status=%s sort=%s %s query=%s",
         page,
         OMS_PAGE_SIZE,
         status,
+        OMS_ORDER_SORT_FIELD,
+        OMS_ORDER_SORT_DIRECTION,
         urlencode(params),
     )
     resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
@@ -531,8 +539,10 @@ async def sync_orders_from_oms(client_id: str) -> dict:
         LOG.info("OMS order sync in test mode entity_id=%s", test_entity)
     else:
         LOG.info(
-            "OMS order sync full fetch status=%s pageSize=%s max_pages=%s",
+            "OMS order sync full fetch status=%s sort=%s %s pageSize=%s max_pages=%s",
             status_filter,
+            OMS_ORDER_SORT_FIELD,
+            OMS_ORDER_SORT_DIRECTION,
             OMS_PAGE_SIZE,
             OMS_MAX_PAGES,
         )
