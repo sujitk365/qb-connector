@@ -934,6 +934,32 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
     return pending[:limit]
 
+def _extract_receive_response_qbxml(body_str: str) -> str:
+    """
+    Pull QuickBooks QBXML from QBWC receiveResponseXML SOAP body.
+    Handles optional CDATA and tag casing differences.
+    """
+    if not body_str or not body_str.strip():
+        return ""
+    patterns = [
+        r"<strHCPResponse[^>]*>([\s\S]*?)</strHCPResponse>",
+        r"<response[^>]*>([\s\S]*?)</response>",
+    ]
+    for pat in patterns:
+        m = re.search(pat, body_str, re.DOTALL | re.IGNORECASE)
+        if not m:
+            continue
+        inner = (m.group(1) or "").strip()
+        if inner.upper().startswith("<![CDATA["):
+            close = inner.rfind("]]>")
+            if close != -1:
+                inner = inner[9:close].strip()
+        text = html.unescape(inner).strip()
+        if text:
+            return text
+    return ""
+
+
 def resolve_dependencies(completed_job_id: str):
     """
     When a customer job completes, unblock any orders waiting for it.
@@ -1331,19 +1357,32 @@ async def qbwc_handler(request: Request):
         session = sessions.get(ticket)
 
         print("📩 Received response from QB!")
-        LOG.info("receiveResponseXML from QB")
+        LOG.info("receiveResponseXML from QB ticket_prefix=%s", (ticket[:8] + "…") if len(ticket) > 8 else ticket)
 
-        # Parse response
-        response_match = re.search(
-            r'<strHCPResponse>(.*?)</strHCPResponse>', body_str, re.DOTALL
-        )
-        if not response_match:
-            response_match = re.search(
-                r'<response>(.*?)</response>', body_str, re.DOTALL
+        if not session:
+            progress = 100
+            LOG.info(
+                "receiveResponseXML: no session for this ticket (server restarted mid-sync, or ticket mismatch). "
+                "body_len=%s snippet=%r",
+                len(body_str),
+                body_str[:500].replace("\n", " ").replace("\r", ""),
             )
+            xml = receive_response(progress)
+            return Response(content=xml, media_type="text/xml; charset=utf-8")
 
-        if response_match and session:
-            raw = html.unescape(response_match.group(1))
+        if session["index"] >= session["total"]:
+            progress = 100
+            LOG.debug(
+                "receiveResponseXML: batch already finished (index=%s total=%s) — QBWC tail call",
+                session["index"],
+                session["total"],
+            )
+            xml = receive_response(progress)
+            return Response(content=xml, media_type="text/xml; charset=utf-8")
+
+        raw = _extract_receive_response_qbxml(body_str)
+
+        if raw:
             job = session["jobs"][session["index"]]
 
             # ── Check status (QB uses attributes on *AddRs as well as child elements) ──
@@ -1465,14 +1504,32 @@ async def qbwc_handler(request: Request):
                 LOG.info("%s jobs remaining progress=%s%%", remaining, progress)
             else:
                 progress = 100
-                print("🏁 All jobs complete — closing session")
-                LOG.info("All jobs complete — closing session")
-                sessions.pop(ticket, None)
+                print("🏁 All jobs complete — session open until QBWC closeConnection")
+                LOG.info(
+                    "All jobs complete for ticket_prefix=%s — session kept until closeConnection",
+                    (ticket[:8] + "…") if len(ticket) > 8 else ticket,
+                )
 
         else:
-            progress = 100
-            print("⚠️ Could not parse response or no session found")
-            LOG.warning("Could not parse QB response or no session (ticket=%s)", ticket[:8] if ticket else "")
+            job = session["jobs"][session["index"]]
+            LOG.error(
+                "receiveResponseXML: no QBXML in SOAP (job=%s op=%s). body_len=%s snippet=%r",
+                job["id"],
+                job["operation"],
+                len(body_str),
+                body_str[:1200].replace("\n", " ").replace("\r", ""),
+            )
+            retry = job["retry_count"] + 1
+            new_status = "dead" if retry >= 3 else "failed"
+            update_job(job["id"], status=new_status, retry_count=retry)
+            session["index"] += 1
+            remaining = session["total"] - session["index"]
+            if remaining > 0:
+                progress = int((session["index"] / session["total"]) * 100)
+                LOG.info("%s jobs remaining after empty QB response progress=%s%%", remaining, progress)
+            else:
+                progress = 100
+                LOG.info("Batch finished after empty QB response — session kept until closeConnection")
 
         xml = receive_response(progress)
 
