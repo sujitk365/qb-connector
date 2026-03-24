@@ -425,9 +425,14 @@ async def fetch_oms_orders_page(
     status: str,
     test_entity_id: Optional[str] = None,
 ) -> Tuple[List, int]:
+    """
+    One page of GET /rest/V1/orders. Magento uses 1-based searchCriteria[currentPage]
+    and searchCriteria[pageSize] (from OMS_PAGE_SIZE, max 500).
+    """
     if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
         raise RuntimeError("OMS_BASE_URL and OMS_ACCESS_TOKEN must be set in environment")
 
+    # Dynamic pagination: pageSize from env, currentPage = 1,2,... in fetch_all_oms_orders
     params = {
         "searchCriteria[sortOrders][0][field]": "entity_id",
         "searchCriteria[sortOrders][0][direction]": "DESC",
@@ -447,7 +452,13 @@ async def fetch_oms_orders_page(
         "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
         "Accept": "application/json",
     }
-    LOG.debug("OMS GET orders page=%s query=%s", page, urlencode(params))
+    LOG.debug(
+        "OMS GET orders currentPage=%s pageSize=%s status=%s query=%s",
+        page,
+        OMS_PAGE_SIZE,
+        status,
+        urlencode(params),
+    )
     resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
@@ -457,6 +468,10 @@ async def fetch_oms_orders_page(
 
 
 async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None) -> List:
+    """
+    Walk all pages until the API returns no items or len(items_fetched) >= total_count,
+    or a single page when test_entity_id is set. Capped by OMS_MAX_PAGES.
+    """
     if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
         print("⚠️ OMS order fetch skipped: OMS_BASE_URL or OMS_ACCESS_TOKEN not set")
         LOG.warning("Skipping OMS order fetch: OMS_BASE_URL or OMS_ACCESS_TOKEN not configured")
@@ -484,8 +499,18 @@ async def fetch_all_oms_orders(status: str, test_entity_id: Optional[str] = None
                 raise
 
             out.extend(items)
-            print(f"📥 OMS orders page={page} batch={len(items)} total_so_far={len(out)} total_count={total}")
-            LOG.info("OMS orders page=%s fetched=%s total_so_far=%s total_count=%s", page, len(items), len(out), total)
+            print(
+                f"📥 OMS orders currentPage={page} pageSize={OMS_PAGE_SIZE} batch={len(items)} "
+                f"total_so_far={len(out)} total_count={total}"
+            )
+            LOG.info(
+                "OMS orders currentPage=%s pageSize=%s fetched=%s total_so_far=%s total_count=%s",
+                page,
+                OMS_PAGE_SIZE,
+                len(items),
+                len(out),
+                total,
+            )
 
             if test_entity_id:
                 break
@@ -504,6 +529,13 @@ async def sync_orders_from_oms(client_id: str) -> dict:
     test_entity = OMS_ORDER_TEST_ENTITY_ID or None
     if test_entity:
         LOG.info("OMS order sync in test mode entity_id=%s", test_entity)
+    else:
+        LOG.info(
+            "OMS order sync full fetch status=%s pageSize=%s max_pages=%s",
+            status_filter,
+            OMS_PAGE_SIZE,
+            OMS_MAX_PAGES,
+        )
 
     try:
         orders = await fetch_all_oms_orders(status_filter, test_entity_id=test_entity)
