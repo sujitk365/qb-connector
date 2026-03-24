@@ -478,6 +478,110 @@ def _magento_order_po_number_only(order: dict) -> str:
     return ""
 
 
+def _magento_region_code(addr: dict) -> str:
+    if not isinstance(addr, dict):
+        return ""
+    v = addr.get("region_code")
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    region = addr.get("region")
+    if isinstance(region, str) and region.strip():
+        return region.strip()
+    if isinstance(region, dict):
+        for key in ("region_code", "code"):
+            x = region.get(key)
+            if x is not None and str(x).strip():
+                return str(x).strip()
+    return ""
+
+
+def _magento_street_lines(addr: dict) -> List[str]:
+    if not isinstance(addr, dict):
+        return []
+    street = addr.get("street")
+    if isinstance(street, list):
+        return [str(s or "").strip() for s in street if s is not None and str(s).strip()]
+    if street is None:
+        return []
+    s = str(street).strip()
+    return [s] if s else []
+
+
+def _magento_order_address_to_qb(addr: Optional[dict]) -> Optional[dict]:
+    """
+    Flatten Magento order address (billing/shipping) into QB BillAddress/ShipAddress fields.
+    Packs name, company, and street lines into Addr1–Addr5 (QB limit).
+    """
+    if not isinstance(addr, dict) or not addr:
+        return None
+    company = (addr.get("company") or "").strip()
+    fn = (addr.get("firstname") or "").strip()
+    ln = (addr.get("lastname") or "").strip()
+    person = " ".join(p for p in (fn, ln) if p).strip()
+    city = (addr.get("city") or "").strip()
+    state = _magento_region_code(addr)
+    postal = (addr.get("postcode") or "").strip()
+    country = (addr.get("country_id") or "").strip()
+    phone = (addr.get("telephone") or "").strip()
+    email = (addr.get("email") or "").strip()
+    street_lines = _magento_street_lines(addr)
+
+    lines: List[str] = []
+    if person:
+        lines.append(person)
+    if company:
+        lines.append(company)
+    lines.extend(street_lines)
+
+    if len(lines) > 5:
+        lines = lines[:4] + [", ".join(lines[4:])]
+    slots = [""] * 5
+    for i in range(min(5, len(lines))):
+        slots[i] = lines[i][:500]
+
+    note_parts = []
+    if phone:
+        note_parts.append(f"Tel: {phone}")
+    if email:
+        note_parts.append(f"Email: {email}")
+    note = " | ".join(note_parts)[:500] if note_parts else ""
+
+    if not any(slots) and not city and not state and not postal and not country and not note:
+        return None
+
+    out = {
+        "addr1": slots[0],
+        "addr2": slots[1],
+        "addr3": slots[2],
+        "addr4": slots[3],
+        "addr5": slots[4],
+        "city": city[:255],
+        "state": state[:255],
+        "postal": postal[:20],
+        "country": country[:255],
+        "note": note,
+    }
+    return out
+
+
+def _magento_order_shipping_address_dict(order: dict) -> Optional[dict]:
+    ext = order.get("extension_attributes")
+    if isinstance(ext, dict):
+        assignments = ext.get("shipping_assignments")
+        if isinstance(assignments, list) and assignments:
+            first = assignments[0]
+            if isinstance(first, dict):
+                shipping = first.get("shipping") or {}
+                if isinstance(shipping, dict):
+                    a = shipping.get("address")
+                    if isinstance(a, dict) and a:
+                        return a
+    sa = order.get("shipping_address")
+    if isinstance(sa, dict) and sa:
+        return sa
+    return None
+
+
 def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     errors: List[str] = []
 
@@ -521,6 +625,11 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     if not lines:
         errors.append("order has no valid lines")
 
+    billing_src = order.get("billing_address")
+    billing_qb = _magento_order_address_to_qb(billing_src if isinstance(billing_src, dict) else None)
+    shipping_src = _magento_order_shipping_address_dict(order)
+    shipping_qb = _magento_order_address_to_qb(shipping_src) if shipping_src else None
+
     payload = {
         "customer_name": customer_name,
         "txn_date": txn_date,
@@ -528,6 +637,11 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "increment_id": increment_id,
         "lines": lines,
     }
+    if billing_qb:
+        payload["billing_address"] = billing_qb
+    if shipping_qb:
+        payload["shipping_address"] = shipping_qb
+
     return payload, errors
 
 
@@ -858,6 +972,32 @@ def build_customer_xml(payload: dict, request_id: str = "1") -> str:
     em = _qb_text_escape(payload.get("email", ""))
     return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="{rid}"><CustomerAdd><Name>{n}</Name><CompanyName>{co}</CompanyName><FirstName>{fn}</FirstName><LastName>{ln}</LastName><BillAddress><Addr1>{a1}</Addr1><City>{city}</City><State>{st}</State><PostalCode>{zipc}</PostalCode><Country>{ctry}</Country></BillAddress><Phone>{ph}</Phone><Email>{em}</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
 
+def _qb_sales_order_address_xml(tag: str, addr: Optional[dict]) -> str:
+    """QBXML BillAddress / ShipAddress under SalesOrderAdd."""
+    if not addr or not isinstance(addr, dict):
+        return ""
+    elems = (
+        ("addr1", "Addr1"),
+        ("addr2", "Addr2"),
+        ("addr3", "Addr3"),
+        ("addr4", "Addr4"),
+        ("addr5", "Addr5"),
+        ("city", "City"),
+        ("state", "State"),
+        ("postal", "PostalCode"),
+        ("country", "Country"),
+        ("note", "Note"),
+    )
+    parts: List[str] = []
+    for k, el in elems:
+        v = addr.get(k)
+        if v is not None and str(v).strip():
+            parts.append(f"<{el}>{_qb_text_escape(str(v).strip())}</{el}>")
+    if not parts:
+        return ""
+    return f"<{tag}>{''.join(parts)}</{tag}>"
+
+
 def build_order_xml(payload: dict, request_id: str = "1") -> str:
     lines_xml = ""
     for line in payload.get("lines", []):
@@ -875,12 +1015,15 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
+    bill_xml = _qb_sales_order_address_xml("BillAddress", payload.get("billing_address"))
+    ship_xml = _qb_sales_order_address_xml("ShipAddress", payload.get("shipping_address"))
     return (
         '<?xml version="1.0" ?><?qbxml version="13.0"?>'
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
+        f"{bill_xml}{ship_xml}"
         f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
