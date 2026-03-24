@@ -220,24 +220,67 @@ def _parse_qbxml_status(raw: str, response_rs_names: Optional[List[str]] = None)
     )
 
 
+def _qb_trim_customer_display_name(display: str) -> str:
+    """Same 41-char rule as magento_customer_to_payload (QuickBooks display name limit)."""
+    display = (display or "").strip()
+    if len(display) > 41:
+        return display[:38] + "..."
+    return display
+
+
+def _magento_order_customer_company_from_order(order: dict) -> str:
+    ext = order.get("extension_attributes")
+    if isinstance(ext, dict):
+        for key in ("customer_company", "company"):
+            v = ext.get(key)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+    v = order.get("customer_company")
+    if v is not None and str(v).strip():
+        return str(v).strip()
+    return ""
+
+
 def _magento_order_customer_display_name(order: dict) -> str:
-    """Prefer billing address name (matches QB / checkout); fall back to customer or email."""
-    ba = order.get("billing_address")
-    if isinstance(ba, dict):
-        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
-        name = " ".join(p for p in parts if p).strip()
-        if name:
-            return name
+    """
+    QuickBooks CustomerRef must match the customer row from customer sync (magento_customer_to_payload).
+
+    Use the Magento customer on the order (customer_firstname/lastname, email, company), not the
+    billing addressee — billing/shipping can list a different person while the account is another.
+    For guest checkout (no customer_id), fall back to billing name like the checkout party.
+    """
+    try:
+        cid_raw = order.get("customer_id")
+        cid_int = int(cid_raw) if cid_raw is not None and str(cid_raw).strip() != "" else 0
+    except (TypeError, ValueError):
+        cid_int = 0
+    registered = cid_int > 0
+
+    company = _magento_order_customer_company_from_order(order)
     fn = (order.get("customer_firstname") or "").strip()
     ln = (order.get("customer_lastname") or "").strip()
     combined = f"{fn} {ln}".strip()
-    if combined:
-        return combined
-    em = str(order.get("customer_email") or "").strip()
-    if em:
-        return em
-    eid = order.get("entity_id")
-    return f"Customer-{eid}" if eid is not None else ""
+    email = str(order.get("customer_email") or "").strip()
+
+    if registered:
+        display = company or combined or email or f"Customer-{cid_int}"
+        return _qb_trim_customer_display_name(display)
+
+    # Guest: no Magento customer id — billing party is the usual QuickBooks counterparty name
+    ba = order.get("billing_address")
+    billing_name = ""
+    billing_company = ""
+    if isinstance(ba, dict):
+        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
+        billing_name = " ".join(p for p in parts if p).strip()
+        billing_company = (ba.get("company") or "").strip()
+
+    display = company or billing_company or billing_name or combined or email or ""
+    if not display:
+        eid = order.get("entity_id")
+        display = f"OrderGuest-{eid}" if eid is not None else ""
+
+    return _qb_trim_customer_display_name(display)
 
 
 def magento_customer_to_payload(customer: dict) -> dict:
@@ -272,9 +315,7 @@ def magento_customer_to_payload(customer: dict) -> dict:
     phone = (addr.get("telephone") or "").strip()
 
     display = company or f"{first} {last}".strip() or email or f"Customer-{cid}"
-    # QuickBooks display name practical limit
-    if len(display) > 41:
-        display = display[:38] + "..."
+    display = _qb_trim_customer_display_name(display)
 
     return {
         "name": display,
