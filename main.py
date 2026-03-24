@@ -220,67 +220,24 @@ def _parse_qbxml_status(raw: str, response_rs_names: Optional[List[str]] = None)
     )
 
 
-def _qb_trim_customer_display_name(display: str) -> str:
-    """Same 41-char rule as magento_customer_to_payload (QuickBooks display name limit)."""
-    display = (display or "").strip()
-    if len(display) > 41:
-        return display[:38] + "..."
-    return display
-
-
-def _magento_order_customer_company_from_order(order: dict) -> str:
-    ext = order.get("extension_attributes")
-    if isinstance(ext, dict):
-        for key in ("customer_company", "company"):
-            v = ext.get(key)
-            if v is not None and str(v).strip():
-                return str(v).strip()
-    v = order.get("customer_company")
-    if v is not None and str(v).strip():
-        return str(v).strip()
-    return ""
-
-
 def _magento_order_customer_display_name(order: dict) -> str:
-    """
-    QuickBooks CustomerRef must match the customer row from customer sync (magento_customer_to_payload).
-
-    Use the Magento customer on the order (customer_firstname/lastname, email, company), not the
-    billing addressee — billing/shipping can list a different person while the account is another.
-    For guest checkout (no customer_id), fall back to billing name like the checkout party.
-    """
-    try:
-        cid_raw = order.get("customer_id")
-        cid_int = int(cid_raw) if cid_raw is not None and str(cid_raw).strip() != "" else 0
-    except (TypeError, ValueError):
-        cid_int = 0
-    registered = cid_int > 0
-
-    company = _magento_order_customer_company_from_order(order)
+    """Prefer billing address name (matches QB / checkout); fall back to customer or email."""
+    ba = order.get("billing_address")
+    if isinstance(ba, dict):
+        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
+        name = " ".join(p for p in parts if p).strip()
+        if name:
+            return name
     fn = (order.get("customer_firstname") or "").strip()
     ln = (order.get("customer_lastname") or "").strip()
     combined = f"{fn} {ln}".strip()
-    email = str(order.get("customer_email") or "").strip()
-
-    if registered:
-        display = company or combined or email or f"Customer-{cid_int}"
-        return _qb_trim_customer_display_name(display)
-
-    # Guest: no Magento customer id — billing party is the usual QuickBooks counterparty name
-    ba = order.get("billing_address")
-    billing_name = ""
-    billing_company = ""
-    if isinstance(ba, dict):
-        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
-        billing_name = " ".join(p for p in parts if p).strip()
-        billing_company = (ba.get("company") or "").strip()
-
-    display = company or billing_company or billing_name or combined or email or ""
-    if not display:
-        eid = order.get("entity_id")
-        display = f"OrderGuest-{eid}" if eid is not None else ""
-
-    return _qb_trim_customer_display_name(display)
+    if combined:
+        return combined
+    em = str(order.get("customer_email") or "").strip()
+    if em:
+        return em
+    eid = order.get("entity_id")
+    return f"Customer-{eid}" if eid is not None else ""
 
 
 def magento_customer_to_payload(customer: dict) -> dict:
@@ -315,7 +272,9 @@ def magento_customer_to_payload(customer: dict) -> dict:
     phone = (addr.get("telephone") or "").strip()
 
     display = company or f"{first} {last}".strip() or email or f"Customer-{cid}"
-    display = _qb_trim_customer_display_name(display)
+    # QuickBooks display name practical limit
+    if len(display) > 41:
+        display = display[:38] + "..."
 
     return {
         "name": display,
@@ -478,110 +437,6 @@ def _magento_order_po_number_only(order: dict) -> str:
     return ""
 
 
-def _magento_region_code(addr: dict) -> str:
-    if not isinstance(addr, dict):
-        return ""
-    v = addr.get("region_code")
-    if v is not None and str(v).strip():
-        return str(v).strip()
-    region = addr.get("region")
-    if isinstance(region, str) and region.strip():
-        return region.strip()
-    if isinstance(region, dict):
-        for key in ("region_code", "code"):
-            x = region.get(key)
-            if x is not None and str(x).strip():
-                return str(x).strip()
-    return ""
-
-
-def _magento_street_lines(addr: dict) -> List[str]:
-    if not isinstance(addr, dict):
-        return []
-    street = addr.get("street")
-    if isinstance(street, list):
-        return [str(s or "").strip() for s in street if s is not None and str(s).strip()]
-    if street is None:
-        return []
-    s = str(street).strip()
-    return [s] if s else []
-
-
-def _magento_order_address_to_qb(addr: Optional[dict]) -> Optional[dict]:
-    """
-    Flatten Magento order address (billing/shipping) into QB BillAddress/ShipAddress fields.
-    Packs name, company, and street lines into Addr1–Addr5 (QB limit).
-    """
-    if not isinstance(addr, dict) or not addr:
-        return None
-    company = (addr.get("company") or "").strip()
-    fn = (addr.get("firstname") or "").strip()
-    ln = (addr.get("lastname") or "").strip()
-    person = " ".join(p for p in (fn, ln) if p).strip()
-    city = (addr.get("city") or "").strip()
-    state = _magento_region_code(addr)
-    postal = (addr.get("postcode") or "").strip()
-    country = (addr.get("country_id") or "").strip()
-    phone = (addr.get("telephone") or "").strip()
-    email = (addr.get("email") or "").strip()
-    street_lines = _magento_street_lines(addr)
-
-    lines: List[str] = []
-    if person:
-        lines.append(person)
-    if company:
-        lines.append(company)
-    lines.extend(street_lines)
-
-    if len(lines) > 5:
-        lines = lines[:4] + [", ".join(lines[4:])]
-    slots = [""] * 5
-    for i in range(min(5, len(lines))):
-        slots[i] = lines[i][:500]
-
-    note_parts = []
-    if phone:
-        note_parts.append(f"Tel: {phone}")
-    if email:
-        note_parts.append(f"Email: {email}")
-    note = " | ".join(note_parts)[:500] if note_parts else ""
-
-    if not any(slots) and not city and not state and not postal and not country and not note:
-        return None
-
-    out = {
-        "addr1": slots[0],
-        "addr2": slots[1],
-        "addr3": slots[2],
-        "addr4": slots[3],
-        "addr5": slots[4],
-        "city": city[:255],
-        "state": state[:255],
-        "postal": postal[:20],
-        "country": country[:255],
-        "note": note,
-    }
-    return out
-
-
-def _magento_order_shipping_address_dict(order: dict) -> Optional[dict]:
-    ext = order.get("extension_attributes")
-    if isinstance(ext, dict):
-        assignments = ext.get("shipping_assignments")
-        if isinstance(assignments, list) and assignments:
-            first = assignments[0]
-            if isinstance(first, dict):
-                shipping = first.get("shipping") or {}
-                if isinstance(shipping, dict):
-                    a = shipping.get("address")
-                    if isinstance(a, dict) and a:
-                        return a
-    sa = order.get("shipping_address")
-    if isinstance(sa, dict) and sa:
-        return sa
-    return None
-
-
 def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     errors: List[str] = []
 
@@ -625,11 +480,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     if not lines:
         errors.append("order has no valid lines")
 
-    billing_src = order.get("billing_address")
-    billing_qb = _magento_order_address_to_qb(billing_src if isinstance(billing_src, dict) else None)
-    shipping_src = _magento_order_shipping_address_dict(order)
-    shipping_qb = _magento_order_address_to_qb(shipping_src) if shipping_src else None
-
     payload = {
         "customer_name": customer_name,
         "txn_date": txn_date,
@@ -637,11 +487,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "increment_id": increment_id,
         "lines": lines,
     }
-    if billing_qb:
-        payload["billing_address"] = billing_qb
-    if shipping_qb:
-        payload["shipping_address"] = shipping_qb
-
     return payload, errors
 
 
@@ -934,32 +779,6 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
     return pending[:limit]
 
-def _extract_receive_response_qbxml(body_str: str) -> str:
-    """
-    Pull QuickBooks QBXML from QBWC receiveResponseXML SOAP body.
-    Handles optional CDATA and tag casing differences.
-    """
-    if not body_str or not body_str.strip():
-        return ""
-    patterns = [
-        r"<strHCPResponse[^>]*>([\s\S]*?)</strHCPResponse>",
-        r"<response[^>]*>([\s\S]*?)</response>",
-    ]
-    for pat in patterns:
-        m = re.search(pat, body_str, re.DOTALL | re.IGNORECASE)
-        if not m:
-            continue
-        inner = (m.group(1) or "").strip()
-        if inner.upper().startswith("<![CDATA["):
-            close = inner.rfind("]]>")
-            if close != -1:
-                inner = inner[9:close].strip()
-        text = html.unescape(inner).strip()
-        if text:
-            return text
-    return ""
-
-
 def resolve_dependencies(completed_job_id: str):
     """
     When a customer job completes, unblock any orders waiting for it.
@@ -998,32 +817,6 @@ def build_customer_xml(payload: dict, request_id: str = "1") -> str:
     em = _qb_text_escape(payload.get("email", ""))
     return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><CustomerAddRq requestID="{rid}"><CustomerAdd><Name>{n}</Name><CompanyName>{co}</CompanyName><FirstName>{fn}</FirstName><LastName>{ln}</LastName><BillAddress><Addr1>{a1}</Addr1><City>{city}</City><State>{st}</State><PostalCode>{zipc}</PostalCode><Country>{ctry}</Country></BillAddress><Phone>{ph}</Phone><Email>{em}</Email></CustomerAdd></CustomerAddRq></QBXMLMsgsRq></QBXML>"""
 
-def _qb_sales_order_address_xml(tag: str, addr: Optional[dict]) -> str:
-    """QBXML BillAddress / ShipAddress under SalesOrderAdd."""
-    if not addr or not isinstance(addr, dict):
-        return ""
-    elems = (
-        ("addr1", "Addr1"),
-        ("addr2", "Addr2"),
-        ("addr3", "Addr3"),
-        ("addr4", "Addr4"),
-        ("addr5", "Addr5"),
-        ("city", "City"),
-        ("state", "State"),
-        ("postal", "PostalCode"),
-        ("country", "Country"),
-        ("note", "Note"),
-    )
-    parts: List[str] = []
-    for k, el in elems:
-        v = addr.get(k)
-        if v is not None and str(v).strip():
-            parts.append(f"<{el}>{_qb_text_escape(str(v).strip())}</{el}>")
-    if not parts:
-        return ""
-    return f"<{tag}>{''.join(parts)}</{tag}>"
-
-
 def build_order_xml(payload: dict, request_id: str = "1") -> str:
     lines_xml = ""
     for line in payload.get("lines", []):
@@ -1041,15 +834,12 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
-    bill_xml = _qb_sales_order_address_xml("BillAddress", payload.get("billing_address"))
-    ship_xml = _qb_sales_order_address_xml("ShipAddress", payload.get("shipping_address"))
     return (
         '<?xml version="1.0" ?><?qbxml version="13.0"?>'
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
-        f"{bill_xml}{ship_xml}"
         f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
@@ -1357,32 +1147,19 @@ async def qbwc_handler(request: Request):
         session = sessions.get(ticket)
 
         print("📩 Received response from QB!")
-        LOG.info("receiveResponseXML from QB ticket_prefix=%s", (ticket[:8] + "…") if len(ticket) > 8 else ticket)
+        LOG.info("receiveResponseXML from QB")
 
-        if not session:
-            progress = 100
-            LOG.info(
-                "receiveResponseXML: no session for this ticket (server restarted mid-sync, or ticket mismatch). "
-                "body_len=%s snippet=%r",
-                len(body_str),
-                body_str[:500].replace("\n", " ").replace("\r", ""),
+        # Parse response
+        response_match = re.search(
+            r'<strHCPResponse>(.*?)</strHCPResponse>', body_str, re.DOTALL
+        )
+        if not response_match:
+            response_match = re.search(
+                r'<response>(.*?)</response>', body_str, re.DOTALL
             )
-            xml = receive_response(progress)
-            return Response(content=xml, media_type="text/xml; charset=utf-8")
 
-        if session["index"] >= session["total"]:
-            progress = 100
-            LOG.debug(
-                "receiveResponseXML: batch already finished (index=%s total=%s) — QBWC tail call",
-                session["index"],
-                session["total"],
-            )
-            xml = receive_response(progress)
-            return Response(content=xml, media_type="text/xml; charset=utf-8")
-
-        raw = _extract_receive_response_qbxml(body_str)
-
-        if raw:
+        if response_match and session:
+            raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
 
             # ── Check status (QB uses attributes on *AddRs as well as child elements) ──
@@ -1504,32 +1281,14 @@ async def qbwc_handler(request: Request):
                 LOG.info("%s jobs remaining progress=%s%%", remaining, progress)
             else:
                 progress = 100
-                print("🏁 All jobs complete — session open until QBWC closeConnection")
-                LOG.info(
-                    "All jobs complete for ticket_prefix=%s — session kept until closeConnection",
-                    (ticket[:8] + "…") if len(ticket) > 8 else ticket,
-                )
+                print("🏁 All jobs complete — closing session")
+                LOG.info("All jobs complete — closing session")
+                sessions.pop(ticket, None)
 
         else:
-            job = session["jobs"][session["index"]]
-            LOG.error(
-                "receiveResponseXML: no QBXML in SOAP (job=%s op=%s). body_len=%s snippet=%r",
-                job["id"],
-                job["operation"],
-                len(body_str),
-                body_str[:1200].replace("\n", " ").replace("\r", ""),
-            )
-            retry = job["retry_count"] + 1
-            new_status = "dead" if retry >= 3 else "failed"
-            update_job(job["id"], status=new_status, retry_count=retry)
-            session["index"] += 1
-            remaining = session["total"] - session["index"]
-            if remaining > 0:
-                progress = int((session["index"] / session["total"]) * 100)
-                LOG.info("%s jobs remaining after empty QB response progress=%s%%", remaining, progress)
-            else:
-                progress = 100
-                LOG.info("Batch finished after empty QB response — session kept until closeConnection")
+            progress = 100
+            print("⚠️ Could not parse response or no session found")
+            LOG.warning("Could not parse QB response or no session (ticket=%s)", ticket[:8] if ticket else "")
 
         xml = receive_response(progress)
 
