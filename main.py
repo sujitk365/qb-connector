@@ -170,6 +170,76 @@ def _qb_text_escape(value: Any) -> str:
     return xml_escape(str(value if value is not None else ""), entities={'"': "&quot;", "'": "&apos;"})
 
 
+def _parse_qbxml_status(raw: str, response_rs_names: Optional[List[str]] = None) -> Tuple[str, str, str]:
+    """
+    QuickBooks often returns statusCode/statusMessage as ATTRIBUTES on *AddRs / *QueryRs
+    (e.g. <SalesOrderAddRs statusCode="3170" statusMessage="..."/>), not child elements.
+    """
+    raw = raw or ""
+
+    def _from_opening_tag(tag: str) -> Optional[Tuple[str, str, str]]:
+        m = re.search(rf"<{re.escape(tag)}\s+([^>]+)>", raw, re.IGNORECASE)
+        if not m:
+            return None
+        attrs = m.group(1)
+        ac = re.search(r'statusCode\s*=\s*"([^"]*)"', attrs, re.I)
+        av = re.search(r'statusSeverity\s*=\s*"([^"]*)"', attrs, re.I)
+        am = re.search(r'statusMessage\s*=\s*"([^"]*)"', attrs, re.I)
+        if not (ac or am or av):
+            return None
+        return (
+            (ac.group(1) if ac else "0").strip(),
+            (av.group(1) if av else "Info").strip(),
+            html.unescape((am.group(1) if am else "").strip()),
+        )
+
+    for name in response_rs_names or []:
+        got = _from_opening_tag(name)
+        if got is not None:
+            return got
+
+    for m in re.finditer(r"<([A-Za-z0-9]+(?:AddRs|QueryRs))\s+([^>]+)>", raw):
+        attrs = m.group(2)
+        ac = re.search(r'statusCode\s*=\s*"([^"]*)"', attrs, re.I)
+        am = re.search(r'statusMessage\s*=\s*"([^"]*)"', attrs, re.I)
+        av = re.search(r'statusSeverity\s*=\s*"([^"]*)"', attrs, re.I)
+        if ac or am or av:
+            code = (ac.group(1) if ac else "0").strip()
+            msg = html.unescape((am.group(1) if am else "").strip())
+            sev = (av.group(1) if av else "Info").strip()
+            if code != "0" or msg:
+                return (code, sev, msg)
+
+    el_c = re.search(r"<statusCode>(.*?)</statusCode>", raw, re.DOTALL | re.I)
+    el_v = re.search(r"<statusSeverity>(.*?)</statusSeverity>", raw, re.DOTALL | re.I)
+    el_m = re.search(r"<statusMessage>(.*?)</statusMessage>", raw, re.DOTALL | re.I)
+    return (
+        (el_c.group(1) or "0").strip() if el_c else "0",
+        (el_v.group(1) or "Info").strip() if el_v else "Info",
+        html.unescape((el_m.group(1) or "").strip()) if el_m else "",
+    )
+
+
+def _magento_order_customer_display_name(order: dict) -> str:
+    """Prefer billing address name (matches QB / checkout); fall back to customer or email."""
+    ba = order.get("billing_address")
+    if isinstance(ba, dict):
+        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
+        name = " ".join(p for p in parts if p).strip()
+        if name:
+            return name
+    fn = (order.get("customer_firstname") or "").strip()
+    ln = (order.get("customer_lastname") or "").strip()
+    combined = f"{fn} {ln}".strip()
+    if combined:
+        return combined
+    em = str(order.get("customer_email") or "").strip()
+    if em:
+        return em
+    eid = order.get("entity_id")
+    return f"Customer-{eid}" if eid is not None else ""
+
+
 def magento_customer_to_payload(customer: dict) -> dict:
     """
     Map Magento REST customer entity to QB CustomerAdd payload fields.
@@ -375,11 +445,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
-    customer_name = (
-        f"{(order.get('customer_firstname') or '').strip()} {(order.get('customer_lastname') or '').strip()}".strip()
-        or str(order.get("customer_email") or "").strip()
-        or f"Customer-{entity_id}"
-    )
+    customer_name = _magento_order_customer_display_name(order)
 
     if not increment_id:
         errors.append("missing increment_id/entity_id")
@@ -1096,14 +1162,17 @@ async def qbwc_handler(request: Request):
             raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
 
-            # ── Check status ──────────────────────────────────
-            status_code = re.search(r'<statusCode>(.*?)</statusCode>', raw)
-            status_msg  = re.search(r'<statusMessage>(.*?)</statusMessage>', raw)
-            status_sev  = re.search(r'<statusSeverity>(.*?)</statusSeverity>', raw)
+            # ── Check status (QB uses attributes on *AddRs as well as child elements) ──
+            if job["operation"] == "push_customer":
+                rs_hint = ["CustomerAddRs"]
+            elif job["operation"] == "push_order":
+                rs_hint = ["SalesOrderAddRs"]
+            elif job["operation"] == "pull_inventory":
+                rs_hint = ["ItemInventoryQueryRs"]
+            else:
+                rs_hint = []
 
-            code = status_code.group(1) if status_code else "0"
-            sev  = status_sev.group(1) if status_sev else "Info"
-            msg  = status_msg.group(1) if status_msg else ""
+            code, sev, msg = _parse_qbxml_status(raw, rs_hint)
             print(f"📋 QB Status: {code} | {sev} | {msg}")
             LOG.info("QB response statusCode=%s severity=%s message=%s", code, sev, msg)
 
@@ -1126,7 +1195,7 @@ async def qbwc_handler(request: Request):
                     # Unblock any orders waiting for this customer
                     resolve_dependencies(job["id"])
                 elif code == "3100":
-                    # Already exists — not a real error for us
+                    # Name not unique / customer already exists — OK for sync
                     print("⚠️ Customer already exists in QB — marking completed")
                     LOG.warning("Customer already exists in QB (code 3100) — marking completed job=%s", job["id"])
                     update_job(job["id"], status="completed")
@@ -1149,14 +1218,26 @@ async def qbwc_handler(request: Request):
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
                 else:
-                    print(f"❌ Order push failed: {msg}")
+                    print(f"❌ Order push failed: {msg or '(no statusMessage — see log for QB XML)'}")
                     LOG.error(
-                        "Order push failed job=%s order_id=%s po=%s customer=%s message=%s",
+                        "Order push failed job=%s order_id=%s increment_id=%s po=%r customer=%r "
+                        "qb_code=%s qb_severity=%s message=%r | CustomerRef FullName must match an "
+                        "existing QuickBooks customer exactly (create customer in QB or sync customers first). "
+                        "Line items must exist as QB products (ItemRef FullName).",
                         job["id"],
                         job.get("k365_id"),
+                        job["payload"].get("increment_id"),
                         job["payload"].get("po_number"),
                         job["payload"].get("customer_name"),
+                        code,
+                        sev,
                         msg,
+                    )
+                    LOG.error(
+                        "Order push QB XML (truncated) job=%s len=%s raw=%s",
+                        job["id"],
+                        len(raw),
+                        (raw.replace("\n", " ").replace("\r", ""))[:4000],
                     )
                     retry = job["retry_count"] + 1
                     new_status = "dead" if retry >= 3 else "failed"
