@@ -200,6 +200,13 @@ OMS_ORDER_INCLUDE_SHIP_ADDRESS = os.getenv("OMS_ORDER_INCLUDE_SHIP_ADDRESS", "1"
     "yes",
     "on",
 )
+# Set SalesOrder RefNumber to Magento increment_id — QB rejects duplicates; we treat that as already synced.
+OMS_ORDER_SEND_QB_REF_NUMBER = os.getenv("OMS_ORDER_SEND_QB_REF_NUMBER", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 @asynccontextmanager
@@ -352,14 +359,13 @@ def _parse_qbxml_status(raw: str, response_rs_names: Optional[List[str]] = None)
     )
 
 
-def _magento_order_customer_display_name(order: dict) -> str:
-    """Prefer billing address name (matches QB / checkout); fall back to customer or email."""
-    ba = order.get("billing_address")
-    if isinstance(ba, dict):
-        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
-        name = " ".join(p for p in parts if p).strip()
-        if name:
-            return name
+def _magento_order_customer_ref_full_name(order: dict) -> str:
+    """
+    QuickBooks CustomerRef FullName — must match an existing QB customer.
+    Use the Magento account (customer_firstname/lastname, email), not the billing-address
+    contact, which can differ (e.g. account holder Bhavesh Bhuva vs bill-to Thomas Martin).
+    Billing contact still appears on the transaction via BillAddress (+ optional Note).
+    """
     fn = (order.get("customer_firstname") or "").strip()
     ln = (order.get("customer_lastname") or "").strip()
     combined = f"{fn} {ln}".strip()
@@ -368,8 +374,45 @@ def _magento_order_customer_display_name(order: dict) -> str:
     em = str(order.get("customer_email") or "").strip()
     if em:
         return em
+    ba = order.get("billing_address")
+    if isinstance(ba, dict):
+        parts = [(ba.get("firstname") or "").strip(), (ba.get("lastname") or "").strip()]
+        name = " ".join(p for p in parts if p).strip()
+        if name:
+            return name
     eid = order.get("entity_id")
     return f"Customer-{eid}" if eid is not None else ""
+
+
+def _magento_billing_attention_note(order: dict, customer_ref_name: str) -> str:
+    """Short 'Attn: …' for BillAddress.Note when bill-to name differs from CustomerRef."""
+    ba = order.get("billing_address")
+    if not isinstance(ba, dict):
+        return ""
+    bfn = (ba.get("firstname") or "").strip()
+    bln = (ba.get("lastname") or "").strip()
+    bill_name = " ".join(p for p in (bfn, bln) if p).strip()
+    if not bill_name:
+        return ""
+    cref = (customer_ref_name or "").strip()
+    if cref and bill_name.lower() == cref.lower():
+        return ""
+    raw = f"Attn: {bill_name}"
+    return _qb_truncate_addr_field("note", raw)
+
+
+def _qb_sales_order_duplicate_ref_error(code: str, msg: str) -> bool:
+    """True if QB rejected the add because this document number / ref is already used."""
+    m = (msg or "").lower()
+    hints = (
+        "already been used",
+        "duplicate document",
+        "number you entered",
+        "already in use",
+        "duplicate ref",
+        "reference number",
+    )
+    return any(h in m for h in hints)
 
 
 def magento_customer_to_payload(customer: dict) -> dict:
@@ -570,7 +613,7 @@ def _magento_order_po_number_only(order: dict) -> str:
 
 
 # QuickBooks BillAddress/ShipAddress field max lengths (SDK IQBStringType).
-_QB_ADDR_MAX = {"addr1": 41, "addr2": 41, "addr3": 41, "city": 31, "state": 21, "postal": 13, "country": 31}
+_QB_ADDR_MAX = {"addr1": 41, "addr2": 41, "addr3": 41, "city": 31, "state": 21, "postal": 13, "country": 31, "note": 41}
 
 
 def _qb_truncate_addr_field(field: str, value: str) -> str:
@@ -670,7 +713,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
-    customer_name = _magento_order_customer_display_name(order)
+    customer_name = _magento_order_customer_ref_full_name(order)
 
     if not increment_id:
         errors.append("missing increment_id/entity_id")
@@ -711,6 +754,10 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         ba = order.get("billing_address")
         if isinstance(ba, dict):
             bill_qb = _magento_address_to_qb(ba)
+            if bill_qb:
+                attn = _magento_billing_attention_note(order, customer_name)
+                if attn:
+                    bill_qb["note"] = attn
     if OMS_ORDER_INCLUDE_SHIP_ADDRESS:
         sa = _magento_order_shipping_address(order)
         if sa is not None:
@@ -1075,6 +1122,8 @@ def _qbxml_address_aggregate(tag: str, a: dict) -> str:
         chunks.append(f"<PostalCode>{_qb_text_escape(a['postal'])}</PostalCode>")
     if a.get("country"):
         chunks.append(f"<Country>{_qb_text_escape(a['country'])}</Country>")
+    if a.get("note"):
+        chunks.append(f"<Note>{_qb_text_escape(a['note'])}</Note>")
     chunks.append(f"</{tag}>")
     return "".join(chunks) if len(chunks) > 2 else ""
 
@@ -1096,6 +1145,11 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
+    ref_xml = ""
+    if OMS_ORDER_SEND_QB_REF_NUMBER:
+        inc = str(payload.get("increment_id") or "").strip()
+        if inc:
+            ref_xml = f"<RefNumber>{_qb_text_escape(inc)}</RefNumber>"
 
     bill_xml = ""
     ship_xml = ""
@@ -1111,7 +1165,7 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
-        f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
+        f"<TxnDate>{txn_date}</TxnDate>{ref_xml}<PONumber>{po_number}</PONumber>"
         f"{bill_xml}{ship_xml}"
         f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
@@ -1499,6 +1553,25 @@ async def qbwc_handler(request: Request):
                     print(f"✅ Order created! TxnID: {qb_txn_id}")
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
+                elif _qb_sales_order_duplicate_ref_error(code, msg):
+                    # Same increment_id / RefNumber already in QB — do not retry (avoids duplicate SO rows).
+                    dup_match = re.search(r"<TxnID>(.*?)</TxnID>", raw)
+                    dup_id = (dup_match.group(1).strip() if dup_match and dup_match.group(1) else "") or "duplicate-ref"
+                    update_job(job["id"], status="completed", qb_id=dup_id)
+                    transaction_map[f"order:{job['k365_id']}"] = dup_id
+                    _persist_synced_order(
+                        str(job["k365_id"]),
+                        dup_id,
+                        str((job.get("payload") or {}).get("increment_id") or ""),
+                    )
+                    print(f"⚠️ Order already in QuickBooks (duplicate ref) — marking synced job={job['id']}")
+                    LOG.warning(
+                        "Sales order duplicate ref treated as success job=%s order_id=%s increment_id=%s message=%r",
+                        job["id"],
+                        job.get("k365_id"),
+                        (job.get("payload") or {}).get("increment_id"),
+                        msg,
+                    )
                 else:
                     print(f"❌ Order push failed: {msg or '(no statusMessage — see log for QB XML)'}")
                     LOG.error(
