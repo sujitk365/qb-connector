@@ -1,0 +1,14 @@
+2026-03-19 15:14:11,825 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
+2026-03-19 15:14:37,147 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
+2026-03-19 15:17:43,419 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
+2026-03-19 15:17:45,501 | INFO | httpx | HTTP Request: GET https://oms.kitchen365test.com/rest/V1/customers/search?searchCriteria[sortOrders][0][field]=created_at&searchCriteria[sortOrders][0][direction]=DESC&searchCriteria[pageSize]=100&searchCriteria[currentPage]=1 "HTTP/1.1 200 OK"
+2026-03-19 15:17:45,504 | INFO | qb_connector | OMS customers page=1 fetched=100 total_so_far=100 total_count=372
+2026-03-19 15:17:46,604 | INFO | httpx | HTTP Request: GET https://oms.kitchen365test.com/rest/V1/customers/search?searchCriteria[sortOrders][0][field]=created_at&searchCriteria[sortOrders][0][direction]=DESC&searchCriteria[pageSize]=100&searchCriteria[currentPage]=2 "HTTP/1.1 200 OK"
+2026-03-19 15:17:46,607 | INFO | qb_connector | OMS customers page=2 fetched=100 total_so_far=200 total_count=372
+2026-03-19 15:17:47,678 | INFO | httpx | HTTP Request: GET https://oms.kitchen365test.com/rest/V1/customers/search?searchCriteria[sortOrders][0][field]=created_at&searchCriteria[sortOrders][0][direction]=DESC&searchCriteria[pageSize]=100&searchCriteria[currentPage]=3 "HTTP/1.1 200 OK"
+2026-03-19 15:17:47,682 | INFO | qb_connector | OMS customers page=3 fetched=100 total_so_far=300 total_count=372
+2026-03-19 15:17:48,677 | INFO | httpx | HTTP Request: GET https://oms.kitchen365test.com/rest/V1/customers/search?searchCriteria[sortOrders][0][field]=created_at&searchCriteria[sortOrders][0][direction]=DESC&searchCriteria[pageSize]=100&searchCriteria[currentPage]=4 "HTTP/1.1 200 OK"
+2026-03-19 15:17:48,681 | INFO | qb_connector | OMS customers page=4 fetched=72 total_so_far=372 total_count=372
+2026-03-19 15:20:06,708 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
+2026-03-19 15:45:15,684 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
+2026-03-19 15:46:27,519 | INFO | qb_connector | File logging enabled: /var/www/html/kitchen365/qb-connector/logs/qb-connector.log
