@@ -1,34 +1,21 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, PlainTextResponse
 import html
-import json
 import logging
 import os
 import re
-import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, List, Optional, Tuple
-from pathlib import Path
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
-
-try:
-    import fcntl
-
-    _HAS_FCNTL = True
-except ImportError:
-    _HAS_FCNTL = False
 from dotenv import load_dotenv
 
 load_dotenv()
-
-# Path for persisted order sync (must be set before sync-state helpers run).
-QB_SYNC_STATE_PATH = (os.getenv("QB_SYNC_STATE_PATH") or "logs/qb_sync_state.json").strip() or "logs/qb_sync_state.json"
 
 # ── Logging (console + rotating file) ────────────────────────────────────────
 LOG = logging.getLogger("qb_connector")
@@ -62,110 +49,6 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
-
-# ── Persisted order sync state (idempotency across restarts) ─────────────────
-_order_state_lock = threading.Lock()
-# Increment IDs already pushed (defense in depth if entity_id ever changes).
-synced_order_increment_ids: set = set()
-
-
-def _qb_sync_state_path() -> Path:
-    p = Path(QB_SYNC_STATE_PATH)
-    if str(p.parent) not in (".", ""):
-        p.parent.mkdir(parents=True, mode=0o755, exist_ok=True)
-    return p
-
-
-def _load_order_sync_state_from_disk() -> None:
-    """
-    Merge persisted successful order syncs into transaction_map and increment-id set.
-    Without this, every app restart re-queues all OMS complete orders → duplicate QB Sales Orders.
-    """
-    global transaction_map, synced_order_increment_ids
-    path = _qb_sync_state_path()
-    if not path.is_file():
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            if _HAS_FCNTL:
-                fcntl.flock(f.fileno(), fcntl.LOCK_SH)
-            try:
-                raw = f.read()
-            finally:
-                if _HAS_FCNTL:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        data = json.loads(raw) if raw.strip() else {}
-        orders = data.get("orders") if isinstance(data, dict) else None
-        if not isinstance(orders, dict):
-            return
-        n = 0
-        for eid, info in orders.items():
-            kid = str(eid).strip()
-            if not kid:
-                continue
-            txn = "synced"
-            inc = ""
-            if isinstance(info, dict):
-                txn = (info.get("txn_id") or txn).strip() or txn
-                inc = str(info.get("increment_id") or "").strip()
-            transaction_map[f"order:{kid}"] = txn
-            if inc:
-                synced_order_increment_ids.add(inc)
-            n += 1
-        LOG.info("Loaded %s synced order(s) from QB sync state file %s", n, path.resolve())
-    except (OSError, json.JSONDecodeError, TypeError) as e:
-        LOG.warning("Could not load QB sync state from %s: %s", path, e)
-
-
-def _persist_synced_order(entity_id: str, txn_id: str, increment_id: str) -> None:
-    """Append/update disk state after QuickBooks accepts a Sales Order."""
-    path = _qb_sync_state_path()
-    eid = str(entity_id).strip()
-    inc = str(increment_id or "").strip()
-    with _order_state_lock:
-        data: dict = {"version": 1, "orders": {}}
-        if path.is_file():
-            try:
-                with open(path, "r", encoding="utf-8") as rf:
-                    if _HAS_FCNTL:
-                        fcntl.flock(rf.fileno(), fcntl.LOCK_EX)
-                    try:
-                        body = rf.read()
-                    finally:
-                        if _HAS_FCNTL:
-                            fcntl.flock(rf.fileno(), fcntl.LOCK_UN)
-                if body.strip():
-                    parsed = json.loads(body)
-                    if isinstance(parsed, dict) and isinstance(parsed.get("orders"), dict):
-                        data["orders"] = dict(parsed["orders"])
-            except (OSError, json.JSONDecodeError, TypeError) as e:
-                LOG.warning("QB sync state corrupt or unreadable, rebuilding: %s", e)
-                data = {"version": 1, "orders": {}}
-
-        data["orders"][eid] = {
-            "txn_id": txn_id,
-            "increment_id": inc,
-            "synced_at": datetime.utcnow().isoformat() + "Z",
-        }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        text = json.dumps(data, indent=2)
-        try:
-            with open(tmp, "w", encoding="utf-8") as wf:
-                wf.write(text)
-                wf.flush()
-                os.fsync(wf.fileno())
-            os.replace(tmp, path)
-        except OSError as e:
-            LOG.error("Failed to persist QB sync state to %s: %s", path, e)
-            try:
-                if tmp.is_file():
-                    tmp.unlink()
-            except OSError:
-                pass
-            return
-    if inc:
-        synced_order_increment_ids.add(inc)
-
 
 # ── Config ──────────────────────────────────────────────────────────────────
 QB_USERNAME = os.getenv("QB_USERNAME", "qbuser")
@@ -215,8 +98,6 @@ app = FastAPI(lifespan=_lifespan)
 sessions = {}          # { ticket: { client_id, jobs, index, total } }
 transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
 last_inventory_pull: Optional[datetime] = None
-
-_load_order_sync_state_from_disk()
 
 # ── POC Job Queue (simulates MySQL qb_sync_queue) ────────────────────────────
 # In production these would come from MySQL.
@@ -748,11 +629,6 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
             continue
         kid = str(entity_id)
-        inc_early = str(order.get("increment_id") or "").strip()
-        if inc_early and inc_early in synced_order_increment_ids:
-            summary["skipped"] += 1
-            LOG.debug("Skip enqueue: order increment_id=%s already in persisted sync state", inc_early)
-            continue
 
         if transaction_map.get(f"order:{kid}"):
             summary["skipped"] += 1
@@ -1338,11 +1214,6 @@ async def qbwc_handler(request: Request):
                     qb_txn_id = txn_id.group(1)
                     update_job(job["id"], status="completed", qb_id=qb_txn_id)
                     transaction_map[f"order:{job['k365_id']}"] = qb_txn_id
-                    _persist_synced_order(
-                        str(job["k365_id"]),
-                        qb_txn_id,
-                        str((job.get("payload") or {}).get("increment_id") or ""),
-                    )
                     print(f"✅ Order created! TxnID: {qb_txn_id}")
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
