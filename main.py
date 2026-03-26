@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, PlainTextResponse
 import html
+import json
 import logging
 import os
 import re
@@ -9,7 +10,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
-from typing import Any, List, Optional, Tuple
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape as xml_escape
 
@@ -793,6 +793,25 @@ def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _format_oms_source_items_http_error(resp: httpx.Response, max_body: int = 4000) -> str:
+    """Magento REST error: parse JSON message when possible, always include truncated body (order-style debugging)."""
+    parts: List[str] = [f"http_status={resp.status_code}"]
+    raw = (resp.text or "").replace("\n", " ").replace("\r", "")
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if msg is not None:
+                parts.append(f"message={msg!r}")
+            params = data.get("parameters")
+            if params is not None:
+                parts.append(f"parameters={params!r}")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    parts.append(f"body_truncated_len={min(len(raw), max_body)} body={raw[:max_body]}")
+    return " ".join(parts)
+
+
 async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[dict]) -> None:
     url = f"{OMS_BASE_URL}/rest/V1/inventory/source-items"
     headers = {
@@ -806,11 +825,14 @@ async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[d
     resp.raise_for_status()
 
 
-async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> Dict[str, Any]:
+async def push_inventory_source_items_to_oms(
+    rows: List[Tuple[str, float]], qb_job_id: Optional[str] = None
+) -> Dict[str, Any]:
     """
     POST source-items directly to Magento (no catalog pre-check).
     On chunk failure, retry each SKU individually to isolate bad items.
     rows: (sku from QB FullName, quantity) — merged by sku (last wins).
+    qb_job_id: QBWC job id for log correlation (same style as order/customer logs).
     """
     summary: Dict[str, Any] = {
         "qb_items": 0,
@@ -865,6 +887,17 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
     sample_cap = 50
     failed_sample: List[str] = []
 
+    oms_endpoint = f"{OMS_BASE_URL}/rest/V1/inventory/source-items"
+    LOG.info(
+        "OMS inventory push start job=%s endpoint=%s source_code=%s status=%s batch_size=%s unique_skus=%s",
+        qb_job_id or "(no job id)",
+        oms_endpoint,
+        OMS_INVENTORY_SOURCE_CODE,
+        OMS_INVENTORY_STATUS,
+        OMS_INVENTORY_BATCH_SIZE,
+        len(sku_list),
+    )
+
     async with httpx.AsyncClient() as client:
         for chunk in _chunk_list(sku_list, OMS_INVENTORY_BATCH_SIZE):
             to_push: List[dict] = []
@@ -894,44 +927,65 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
                 summary["pushed_to_magento"] += len(to_push)
                 sample = to_push[: min(5, len(to_push))]
                 LOG.info(
-                    "OMS POST source-items OK | count=%s sample_qty=%s",
+                    "OMS inventory source-items batch OK job=%s count=%s sample_sku_qty=%s | "
+                    "Verify SKU exists in Magento and matches OMS source %s",
+                    qb_job_id or "(no job id)",
                     len(to_push),
                     [(x.get("sku"), x.get("quantity")) for x in sample],
+                    OMS_INVENTORY_SOURCE_CODE,
                 )
             except httpx.HTTPStatusError as e:
                 summary["api_errors"] += 1
+                detail = _format_oms_source_items_http_error(e.response)
                 LOG.error(
-                    "OMS POST source-items chunk failed status=%s body=%s | retrying each sku",
-                    e.response.status_code,
-                    (e.response.text or "")[:500],
+                    "OMS inventory source-items batch FAILED job=%s chunk_size=%s | %s | "
+                    "Retrying each SKU. Common fixes: invalid SKU, missing product in catalog, "
+                    "wrong source_code, integration token missing Inventory permissions.",
+                    qb_job_id or "(no job id)",
+                    len(to_push),
+                    detail,
                 )
                 # Retry one-by-one so one bad SKU does not block all good SKUs in chunk.
                 for item in to_push:
                     try:
                         await _oms_post_source_items(client, [item])
                         summary["pushed_to_magento"] += 1
+                        LOG.info(
+                            "OMS inventory source-item OK job=%s sku=%r qty=%s source_code=%s",
+                            qb_job_id or "(no job id)",
+                            item.get("sku"),
+                            item.get("quantity"),
+                            OMS_INVENTORY_SOURCE_CODE,
+                        )
                     except httpx.HTTPStatusError as ie:
                         summary["api_errors"] += 1
                         summary["failed_to_push"] += 1
                         if len(failed_sample) < sample_cap:
                             failed_sample.append(str(item.get("sku")))
+                        skid = _format_oms_source_items_http_error(ie.response, max_body=2000)
                         LOG.error(
-                            "OMS POST source-item failed sku=%s qty=%s status=%s body=%s",
+                            "OMS inventory source-item FAILED job=%s sku=%r qty=%s http_status=%s source_code=%s | %s | "
+                            "Magento must have this exact SKU; check MSI stock for this source and integration API permissions (Inventory).",
+                            qb_job_id or "(no job id)",
                             item.get("sku"),
                             item.get("quantity"),
                             ie.response.status_code,
-                            (ie.response.text or "")[:500],
+                            OMS_INVENTORY_SOURCE_CODE,
+                            skid,
                         )
                     except Exception as ie:
                         summary["api_errors"] += 1
                         summary["failed_to_push"] += 1
                         if len(failed_sample) < sample_cap:
                             failed_sample.append(str(item.get("sku")))
-                        LOG.exception(
-                            "OMS POST source-item failed sku=%s qty=%s: %s",
+                        LOG.error(
+                            "OMS inventory source-item FAILED job=%s sku=%r qty=%s source_code=%s | exception=%s",
+                            qb_job_id or "(no job id)",
                             item.get("sku"),
                             item.get("quantity"),
+                            OMS_INVENTORY_SOURCE_CODE,
                             ie,
+                            exc_info=True,
                         )
             except Exception as e:
                 summary["api_errors"] += 1
@@ -939,12 +993,20 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
                 for item in to_push:
                     if len(failed_sample) < sample_cap:
                         failed_sample.append(str(item.get("sku")))
-                LOG.exception("OMS POST source-items failed: %s", e)
+                LOG.error(
+                    "OMS inventory source-items batch EXCEPTION job=%s chunk_size=%s | %s | "
+                    "No HTTP response; check network, OMS_BASE_URL, TLS, timeout.",
+                    qb_job_id or "(no job id)",
+                    len(to_push),
+                    e,
+                    exc_info=True,
+                )
 
     summary["failed_skus_sample"] = failed_sample
     LOG.info(
-        "OMS inventory push done | qb_items=%s skipped_invalid=%s attempted_to_magento=%s "
-        "pushed_to_magento=%s failed_to_push=%s api_errors=%s failed_sample_first=%s",
+        "OMS inventory push done job=%s | qb_items=%s skipped_invalid=%s attempted_to_magento=%s "
+        "pushed_to_magento=%s failed_to_push=%s api_errors=%s failed_sku_sample_count=%s",
+        qb_job_id or "(no job id)",
         summary["qb_items"],
         summary["skipped_invalid"],
         summary["attempted_to_magento"],
@@ -954,9 +1016,11 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
         len(failed_sample),
     )
     if failed_sample:
-        LOG.info(
-            "OMS failed source-items (sample up to %s): %s",
+        LOG.warning(
+            "OMS inventory source-items failed SKUs (sample up to %s) job=%s: %s | "
+            "Match QuickBooks Item FullName to Magento product SKU exactly.",
             sample_cap,
+            qb_job_id or "(no job id)",
             failed_sample[:sample_cap],
         )
     return summary
@@ -1096,6 +1160,31 @@ def receive_response(progress: int) -> str:
 </soap:Envelope>"""
 
 
+def _detect_soap_action(body_str: str, soap_action_header: str) -> str:
+    """
+    Detect QBWC SOAP action robustly from SOAPAction header first, then SOAP body local tag.
+    Handles namespace/prefix variants like ns1:sendRequestXML.
+    """
+    hdr = (soap_action_header or "").strip().strip('"').strip("'")
+    if hdr:
+        # Common forms:
+        # - http://developer.intuit.com/sendRequestXML
+        # - sendRequestXML
+        # - ...#sendRequestXML
+        tail = re.split(r"[/#]", hdr)[-1].strip()
+        if tail:
+            return tail
+
+    body_match = re.search(
+        r"<(?:[A-Za-z_][\w\-.]*:)?Body\b[^>]*>\s*<(?:(?:[A-Za-z_][\w\-.]*):)?([A-Za-z_][\w\-.]*)\b",
+        body_str,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if body_match:
+        return body_match.group(1)
+    return ""
+
+
 # ── Status endpoint (simple dashboard) ──────────────────────────────────────
 @app.get("/status")
 async def status():
@@ -1175,24 +1264,27 @@ async def api_sync_orders(request: Request):
 async def qbwc_handler(request: Request):
     body = await request.body()
     body_str = body.decode("utf-8")
+    soap_action_header = request.headers.get("SOAPAction") or request.headers.get("Soapaction") or ""
+    soap_action = _detect_soap_action(body_str, soap_action_header)
     print("\n" + "=" * 60)
     print("📥 Received:", body_str[:200])
+    LOG.info("QBWC SOAP action=%s header=%s", soap_action or "(undetected)", soap_action_header or "(none)")
     LOG.debug("QBWC request (first 500 chars): %s", body_str[:500])
 
     # ── serverVersion ──────────────────────────────────────────
-    if "serverVersion" in body_str:
+    if soap_action == "serverVersion" or "serverVersion" in body_str:
         print("📌 serverVersion")
         LOG.debug("SOAP serverVersion")
         xml = soap_envelope("serverVersion", "<serverVersionRet>1.0</serverVersionRet>")
 
     # ── clientVersion ──────────────────────────────────────────
-    elif "clientVersion" in body_str:
+    elif soap_action == "clientVersion" or "clientVersion" in body_str:
         print("📌 clientVersion")
         LOG.debug("SOAP clientVersion")
         xml = soap_envelope("clientVersion", "<clientVersionRet></clientVersionRet>")
 
     # ── authenticate ───────────────────────────────────────────
-    elif "authenticate" in body_str:
+    elif soap_action == "authenticate" or "authenticate" in body_str:
         u_match = re.search(r'<strUserName>(.*?)</strUserName>', body_str)
         p_match = re.search(r'<strPassword>(.*?)</strPassword>', body_str)
         u = u_match.group(1) if u_match else ""
@@ -1298,7 +1390,7 @@ async def qbwc_handler(request: Request):
 </soap:Envelope>"""
 
     # ── sendRequestXML ─────────────────────────────────────────
-    elif "sendRequestXML" in body_str:
+    elif soap_action == "sendRequestXML" or "sendRequestXML" in body_str:
         ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
         ticket = ticket_match.group(1) if ticket_match else ""
         session = sessions.get(ticket)
@@ -1353,7 +1445,7 @@ async def qbwc_handler(request: Request):
             xml = send_request_response(qbxml)
 
     # ── receiveResponseXML ─────────────────────────────────────
-    elif "receiveResponseXML" in body_str:
+    elif soap_action == "receiveResponseXML" or "receiveResponseXML" in body_str:
         ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
         ticket = ticket_match.group(1) if ticket_match else ""
         session = sessions.get(ticket)
@@ -1490,7 +1582,7 @@ async def qbwc_handler(request: Request):
                     parse_skipped,
                     preview,
                 )
-                inv_summary = await push_inventory_source_items_to_oms(rows)
+                inv_summary = await push_inventory_source_items_to_oms(rows, qb_job_id=job["id"])
                 inv_summary["skipped_invalid"] = int(inv_summary.get("skipped_invalid") or 0) + parse_skipped
                 last_inventory_oms_summary = inv_summary
                 print(
@@ -1526,13 +1618,13 @@ async def qbwc_handler(request: Request):
         xml = receive_response(progress)
 
     # ── getLastError ───────────────────────────────────────────
-    elif "getLastError" in body_str:
+    elif soap_action == "getLastError" or "getLastError" in body_str:
         print("⚠️ getLastError called")
         LOG.warning("getLastError called")
         xml = soap_envelope("getLastError", "")
 
     # ── closeConnection ────────────────────────────────────────
-    elif "closeConnection" in body_str:
+    elif soap_action == "closeConnection" or "closeConnection" in body_str:
         ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
         ticket = ticket_match.group(1) if ticket_match else ""
         sessions.pop(ticket, None)
@@ -1552,7 +1644,12 @@ async def qbwc_handler(request: Request):
     # ── unknown ────────────────────────────────────────────────
     else:
         print("❓ Unknown:", body_str[:200])
-        LOG.warning("Unknown SOAP action (truncated): %s", body_str[:200])
+        LOG.warning(
+            "Unknown SOAP action detected=%s header=%s body_truncated=%s",
+            soap_action or "(undetected)",
+            soap_action_header or "(none)",
+            body_str[:200],
+        )
         xml = """<?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
   <soap:Body/>
