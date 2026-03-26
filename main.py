@@ -14,7 +14,13 @@ from urllib.parse import urlencode
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        # Keep app booting even if python-dotenv is not installed in runtime.
+        return False
 
 load_dotenv()
 
