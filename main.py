@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
 import httpx
@@ -61,6 +61,15 @@ OMS_SYNC_API_KEY = (os.getenv("OMS_SYNC_API_KEY") or "").strip()
 OMS_MAX_PAGES = max(1, int(os.getenv("OMS_MAX_PAGES", "500")))
 # How many queue jobs QB Web Connector receives per session (auth); not OMS API page size.
 QBWC_JOB_BATCH_SIZE = max(1, min(500, int(os.getenv("QBWC_JOB_BATCH_SIZE", "100"))))
+OMS_INVENTORY_SOURCE_CODE = (os.getenv("OMS_INVENTORY_SOURCE_CODE") or "default").strip()
+OMS_INVENTORY_STATUS = int(os.getenv("OMS_INVENTORY_STATUS", "1"))
+OMS_INVENTORY_BATCH_SIZE = max(1, min(500, int(os.getenv("OMS_INVENTORY_BATCH_SIZE", "100"))))
+OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 @asynccontextmanager
@@ -85,10 +94,12 @@ app = FastAPI(lifespan=_lifespan)
 # job_queue      : pending jobs to process (simulates qb_sync_queue table)
 # transaction_map: completed jobs (simulates qb_transaction_map table)
 # last_inventory_pull: timestamp of last inventory sync
+# last_inventory_oms_summary: last Magento source-items push stats (pull_inventory job)
 
 sessions = {}          # { ticket: { client_id, jobs, index, total } }
 transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
 last_inventory_pull: Optional[datetime] = None
+last_inventory_oms_summary: Optional[Dict[str, Any]] = None
 
 # ── POC Job Queue (simulates MySQL qb_sync_queue) ────────────────────────────
 # In production these would come from MySQL.
@@ -416,6 +427,192 @@ async def sync_customers_from_oms(client_id: str) -> dict:
     return summary
 
 
+def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+async def _oms_get_products_sku_canonical_map(
+    client: httpx.AsyncClient, skus: List[str]
+) -> Dict[str, str]:
+    """
+    GET products search sku in (...). Returns mapping lower(sku)->canonical sku from Magento.
+    """
+    if not skus:
+        return {}
+    url = f"{OMS_BASE_URL}/rest/V1/products"
+    params: List[Tuple[str, str]] = [
+        ("searchCriteria[filterGroups][0][filters][0][field]", "sku"),
+        ("searchCriteria[filterGroups][0][filters][0][condition_type]", "in"),
+        ("searchCriteria[pageSize]", str(min(500, max(len(skus), 1)))),
+        ("searchCriteria[currentPage]", "1"),
+    ]
+    for sku in skus:
+        params.append(("searchCriteria[filterGroups][0][filters][0][value][]", sku))
+    headers = {
+        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
+        "Accept": "application/json",
+    }
+    LOG.debug("OMS GET products sku in batch count=%s", len(skus))
+    resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    canon_by_lower: Dict[str, str] = {}
+    for it in data.get("items") or []:
+        s = it.get("sku")
+        if s is not None and str(s).strip():
+            canon = str(s).strip()
+            canon_by_lower[canon.lower()] = canon
+    return canon_by_lower
+
+
+async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[dict]) -> None:
+    url = f"{OMS_BASE_URL}/rest/V1/inventory/source-items"
+    headers = {
+        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    resp = await client.post(
+        url, json={"sourceItems": source_items}, headers=headers, timeout=OMS_REQUEST_TIMEOUT
+    )
+    resp.raise_for_status()
+
+
+async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> Dict[str, Any]:
+    """
+    Resolve SKUs against Magento catalog, POST source-items for existing SKUs only.
+    rows: (sku from QB FullName, quantity) — merged by sku (last wins).
+    """
+    summary: Dict[str, Any] = {
+        "qb_items": 0,
+        "skipped_invalid": 0,
+        "not_found_in_magento": 0,
+        "pushed_to_magento": 0,
+        "api_errors": 0,
+        "not_found_skus_sample": [],
+        "push_enabled": OMS_INVENTORY_PUSH_ENABLED,
+        "skip_reason": None,
+    }
+    merged: Dict[str, float] = {}
+    for sku, qty in rows:
+        s = str(sku).strip() if sku is not None else ""
+        if not s:
+            summary["skipped_invalid"] += 1
+            continue
+        try:
+            q = float(qty)
+        except (TypeError, ValueError):
+            summary["skipped_invalid"] += 1
+            continue
+        if q < 0:
+            summary["skipped_invalid"] += 1
+            continue
+        merged[s] = q
+    summary["qb_items"] = len(merged)
+
+    if not OMS_BASE_URL or not OMS_ACCESS_TOKEN:
+        summary["skip_reason"] = "OMS_BASE_URL or OMS_ACCESS_TOKEN not set"
+        LOG.warning("OMS inventory push skipped: %s", summary["skip_reason"])
+        return summary
+
+    if not OMS_INVENTORY_PUSH_ENABLED:
+        summary["skip_reason"] = "OMS_INVENTORY_PUSH_ENABLED is off"
+        LOG.info(
+            "OMS inventory push disabled | qb_items=%s skipped_invalid=%s",
+            summary["qb_items"],
+            summary["skipped_invalid"],
+        )
+        return summary
+
+    if not merged:
+        LOG.info(
+            "OMS inventory push | qb_items=0 skipped_invalid=%s",
+            summary["skipped_invalid"],
+        )
+        return summary
+
+    sku_list = list(merged.keys())
+    sample_cap = 50
+    not_found_sample: List[str] = []
+
+    async with httpx.AsyncClient() as client:
+        for chunk in _chunk_list(sku_list, OMS_INVENTORY_BATCH_SIZE):
+            try:
+                canon_by_lower = await _oms_get_products_sku_canonical_map(client, chunk)
+            except httpx.HTTPStatusError as e:
+                summary["api_errors"] += 1
+                LOG.error(
+                    "OMS GET products HTTP error status=%s body=%s",
+                    e.response.status_code,
+                    (e.response.text or "")[:500],
+                )
+                continue
+            except Exception as e:
+                summary["api_errors"] += 1
+                LOG.exception("OMS GET products failed: %s", e)
+                continue
+
+            to_push: List[dict] = []
+            for sku in chunk:
+                canon = canon_by_lower.get(sku.lower())
+                if not canon:
+                    summary["not_found_in_magento"] += 1
+                    if len(not_found_sample) < sample_cap:
+                        not_found_sample.append(sku)
+                    continue
+                to_push.append(
+                    {
+                        "sku": canon,
+                        "source_code": OMS_INVENTORY_SOURCE_CODE,
+                        "quantity": merged[sku],
+                        "status": OMS_INVENTORY_STATUS,
+                    }
+                )
+                LOG.debug(
+                    "OMS source-item candidate sku=%s qty=%s source=%s status=%s",
+                    canon,
+                    merged[sku],
+                    OMS_INVENTORY_SOURCE_CODE,
+                    OMS_INVENTORY_STATUS,
+                )
+
+            if not to_push:
+                continue
+
+            try:
+                await _oms_post_source_items(client, to_push)
+                summary["pushed_to_magento"] += len(to_push)
+            except httpx.HTTPStatusError as e:
+                summary["api_errors"] += 1
+                LOG.error(
+                    "OMS POST source-items HTTP error status=%s body=%s",
+                    e.response.status_code,
+                    (e.response.text or "")[:500],
+                )
+            except Exception as e:
+                summary["api_errors"] += 1
+                LOG.exception("OMS POST source-items failed: %s", e)
+
+    summary["not_found_skus_sample"] = not_found_sample
+    LOG.info(
+        "OMS inventory push done | qb_items=%s skipped_invalid=%s not_found_in_magento=%s "
+        "pushed_to_magento=%s api_errors=%s not_found_sample_first=%s",
+        summary["qb_items"],
+        summary["skipped_invalid"],
+        summary["not_found_in_magento"],
+        summary["pushed_to_magento"],
+        summary["api_errors"],
+        len(not_found_sample),
+    )
+    if not_found_sample:
+        LOG.info(
+            "OMS SKUs not in Magento catalog (sample up to %s): %s",
+            sample_cap,
+            not_found_sample[:sample_cap],
+        )
+    return summary
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_job(job_id: str):
@@ -549,7 +746,8 @@ async def status():
         ],
         "transaction_map": transaction_map,
         "active_sessions": list(sessions.keys()),
-        "last_inventory_pull": str(last_inventory_pull) if last_inventory_pull else "never"
+        "last_inventory_pull": str(last_inventory_pull) if last_inventory_pull else "never",
+        "last_inventory_oms_summary": last_inventory_oms_summary,
     }
 
 @app.get("/")
@@ -816,30 +1014,46 @@ async def qbwc_handler(request: Request):
                     update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "pull_inventory":
-                global last_inventory_pull
+                global last_inventory_pull, last_inventory_oms_summary
                 items = re.findall(
                     r'<ItemInventoryRet>(.*?)</ItemInventoryRet>', raw, re.DOTALL
                 )
                 print(f"✅ Found {len(items)} inventory items")
                 LOG.info("Inventory query returned %s items", len(items))
+                rows: List[Tuple[str, float]] = []
+                parse_skipped = 0
                 for item in items:
                     name  = re.search(r'<FullName>(.*?)</FullName>', item)
                     price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
                     cost  = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
                     qty   = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
-                    print(
-                        f"   📦 {name.group(1) if name else 'N/A'} | "
-                        f"Price: {price.group(1) if price else 'N/A'} | "
-                        f"Cost: {cost.group(1) if cost else 'N/A'} | "
-                        f"Qty: {qty.group(1) if qty else 'N/A'}"
-                    )
+                    sku_txt = (name.group(1) if name else "") or ""
+                    qty_txt = (qty.group(1) if qty else "") or ""
+                    try:
+                        qty_val = float(qty_txt.strip()) if qty_txt.strip() else None
+                    except (TypeError, ValueError):
+                        qty_val = None
+                    if sku_txt.strip() and qty_val is not None:
+                        rows.append((sku_txt.strip(), qty_val))
+                    else:
+                        parse_skipped += 1
                     LOG.debug(
-                        "  item=%s price=%s cost=%s qty=%s",
-                        name.group(1) if name else "N/A",
+                        "QB item sku=%s price=%s cost=%s qty=%s",
+                        sku_txt or "N/A",
                         price.group(1) if price else "N/A",
                         cost.group(1) if cost else "N/A",
-                        qty.group(1) if qty else "N/A",
+                        qty_txt or "N/A",
                     )
+                inv_summary = await push_inventory_source_items_to_oms(rows)
+                inv_summary["skipped_invalid"] = int(inv_summary.get("skipped_invalid") or 0) + parse_skipped
+                last_inventory_oms_summary = inv_summary
+                print(
+                    f"📊 OMS inventory | qb_items={inv_summary.get('qb_items')} "
+                    f"pushed={inv_summary.get('pushed_to_magento')} "
+                    f"not_found={inv_summary.get('not_found_in_magento')} "
+                    f"skipped_invalid={inv_summary.get('skipped_invalid')} "
+                    f"api_errors={inv_summary.get('api_errors')}"
+                )
                 last_inventory_pull = datetime.now()
                 update_job(job["id"], status="completed")
 
