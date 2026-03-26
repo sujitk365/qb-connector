@@ -812,6 +812,28 @@ def _format_oms_source_items_http_error(resp: httpx.Response, max_body: int = 40
     return " ".join(parts)
 
 
+def _is_magento_sku_not_found_response(resp: httpx.Response) -> bool:
+    """Best-effort classifier for Magento product/SKU not found errors."""
+    msg = ""
+    try:
+        data = resp.json()
+        if isinstance(data, dict):
+            msg = str(data.get("message") or "")
+    except (json.JSONDecodeError, ValueError, TypeError):
+        msg = ""
+    low = msg.lower()
+    if not low:
+        return False
+    markers = (
+        "requested sku",
+        "doesn't exist",
+        "does not exist",
+        "no such entity",
+        "requested product",
+    )
+    return any(m in low for m in markers)
+
+
 async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[dict]) -> None:
     url = f"{OMS_BASE_URL}/rest/V1/inventory/source-items"
     headers = {
@@ -840,6 +862,7 @@ async def push_inventory_source_items_to_oms(
         "attempted_to_magento": 0,
         "pushed_to_magento": 0,
         "failed_to_push": 0,
+        "ignored_not_found": 0,
         "api_errors": 0,
         "failed_skus_sample": [],
         "push_enabled": OMS_INVENTORY_PUSH_ENABLED,
@@ -963,16 +986,28 @@ async def push_inventory_source_items_to_oms(
                         if len(failed_sample) < sample_cap:
                             failed_sample.append(str(item.get("sku")))
                         skid = _format_oms_source_items_http_error(ie.response, max_body=2000)
-                        LOG.error(
-                            "OMS inventory source-item FAILED job=%s sku=%r qty=%s http_status=%s source_code=%s | %s | "
-                            "Magento must have this exact SKU; check MSI stock for this source and integration API permissions (Inventory).",
-                            qb_job_id or "(no job id)",
-                            item.get("sku"),
-                            item.get("quantity"),
-                            ie.response.status_code,
-                            OMS_INVENTORY_SOURCE_CODE,
-                            skid,
-                        )
+                        if _is_magento_sku_not_found_response(ie.response):
+                            summary["ignored_not_found"] += 1
+                            LOG.warning(
+                                "OMS inventory source-item IGNORED_NOT_FOUND job=%s sku=%r qty=%s http_status=%s source_code=%s | %s",
+                                qb_job_id or "(no job id)",
+                                item.get("sku"),
+                                item.get("quantity"),
+                                ie.response.status_code,
+                                OMS_INVENTORY_SOURCE_CODE,
+                                skid,
+                            )
+                        else:
+                            LOG.error(
+                                "OMS inventory source-item FAILED job=%s sku=%r qty=%s http_status=%s source_code=%s | %s | "
+                                "Magento must have this exact SKU; check MSI stock for this source and integration API permissions (Inventory).",
+                                qb_job_id or "(no job id)",
+                                item.get("sku"),
+                                item.get("quantity"),
+                                ie.response.status_code,
+                                OMS_INVENTORY_SOURCE_CODE,
+                                skid,
+                            )
                     except Exception as ie:
                         summary["api_errors"] += 1
                         summary["failed_to_push"] += 1
@@ -1005,12 +1040,13 @@ async def push_inventory_source_items_to_oms(
     summary["failed_skus_sample"] = failed_sample
     LOG.info(
         "OMS inventory push done job=%s | qb_items=%s skipped_invalid=%s attempted_to_magento=%s "
-        "pushed_to_magento=%s failed_to_push=%s api_errors=%s failed_sku_sample_count=%s",
+        "pushed_to_magento=%s ignored_not_found=%s failed_to_push=%s api_errors=%s failed_sku_sample_count=%s",
         qb_job_id or "(no job id)",
         summary["qb_items"],
         summary["skipped_invalid"],
         summary["attempted_to_magento"],
         summary["pushed_to_magento"],
+        summary["ignored_not_found"],
         summary["failed_to_push"],
         summary["api_errors"],
         len(failed_sample),
@@ -1589,9 +1625,21 @@ async def qbwc_handler(request: Request):
                     f"📊 OMS inventory | qb_items={inv_summary.get('qb_items')} "
                     f"attempted={inv_summary.get('attempted_to_magento')} "
                     f"pushed={inv_summary.get('pushed_to_magento')} "
+                    f"ignored_not_found={inv_summary.get('ignored_not_found')} "
                     f"failed={inv_summary.get('failed_to_push')} "
                     f"skipped_invalid={inv_summary.get('skipped_invalid')} "
                     f"api_errors={inv_summary.get('api_errors')}"
+                )
+                LOG.info(
+                    "OMS inventory summary job=%s | qb_items=%s attempted=%s pushed=%s ignored_not_found=%s failed=%s skipped_invalid=%s api_errors=%s",
+                    job["id"],
+                    inv_summary.get("qb_items"),
+                    inv_summary.get("attempted_to_magento"),
+                    inv_summary.get("pushed_to_magento"),
+                    inv_summary.get("ignored_not_found"),
+                    inv_summary.get("failed_to_push"),
+                    inv_summary.get("skipped_invalid"),
+                    inv_summary.get("api_errors"),
                 )
                 last_inventory_pull = datetime.now()
                 update_job(job["id"], status="completed")
