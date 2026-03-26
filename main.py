@@ -793,48 +793,6 @@ def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-async def _oms_get_products_sku_canonical_map(
-    client: httpx.AsyncClient, skus: List[str]
-) -> Dict[str, str]:
-    """
-    GET products search sku in (...). Returns mapping lower(sku)->canonical sku from Magento.
-    """
-    if not skus:
-        return {}
-    url = f"{OMS_BASE_URL}/rest/V1/products"
-    params: List[Tuple[str, str]] = [
-        ("searchCriteria[filterGroups][0][filters][0][field]", "sku"),
-        ("searchCriteria[filterGroups][0][filters][0][condition_type]", "in"),
-        ("searchCriteria[pageSize]", str(min(500, max(len(skus), 1)))),
-        ("searchCriteria[currentPage]", "1"),
-    ]
-    for sku in skus:
-        params.append(("searchCriteria[filterGroups][0][filters][0][value][]", sku))
-    headers = {
-        "Authorization": f"Bearer {OMS_ACCESS_TOKEN}",
-        "Accept": "application/json",
-    }
-    LOG.debug("OMS GET products sku in batch count=%s", len(skus))
-    resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-    items = list(data.get("items") or [])
-    total_count = int(data.get("total_count") or 0)
-    LOG.info(
-        "OMS GET products sku in | batch_requested=%s items_returned=%s total_count=%s",
-        len(skus),
-        len(items),
-        total_count,
-    )
-    canon_by_lower: Dict[str, str] = {}
-    for it in items:
-        s = it.get("sku")
-        if s is not None and str(s).strip():
-            canon = str(s).strip()
-            canon_by_lower[canon.lower()] = canon
-    return canon_by_lower
-
-
 async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[dict]) -> None:
     url = f"{OMS_BASE_URL}/rest/V1/inventory/source-items"
     headers = {
@@ -850,16 +808,18 @@ async def _oms_post_source_items(client: httpx.AsyncClient, source_items: List[d
 
 async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> Dict[str, Any]:
     """
-    Resolve SKUs against Magento catalog, POST source-items for existing SKUs only.
+    POST source-items directly to Magento (no catalog pre-check).
+    On chunk failure, retry each SKU individually to isolate bad items.
     rows: (sku from QB FullName, quantity) — merged by sku (last wins).
     """
     summary: Dict[str, Any] = {
         "qb_items": 0,
         "skipped_invalid": 0,
-        "not_found_in_magento": 0,
+        "attempted_to_magento": 0,
         "pushed_to_magento": 0,
+        "failed_to_push": 0,
         "api_errors": 0,
-        "not_found_skus_sample": [],
+        "failed_skus_sample": [],
         "push_enabled": OMS_INVENTORY_PUSH_ENABLED,
         "skip_reason": None,
     }
@@ -903,36 +863,15 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
 
     sku_list = list(merged.keys())
     sample_cap = 50
-    not_found_sample: List[str] = []
+    failed_sample: List[str] = []
 
     async with httpx.AsyncClient() as client:
         for chunk in _chunk_list(sku_list, OMS_INVENTORY_BATCH_SIZE):
-            try:
-                canon_by_lower = await _oms_get_products_sku_canonical_map(client, chunk)
-            except httpx.HTTPStatusError as e:
-                summary["api_errors"] += 1
-                LOG.error(
-                    "OMS GET products HTTP error status=%s body=%s",
-                    e.response.status_code,
-                    (e.response.text or "")[:500],
-                )
-                continue
-            except Exception as e:
-                summary["api_errors"] += 1
-                LOG.exception("OMS GET products failed: %s", e)
-                continue
-
             to_push: List[dict] = []
             for sku in chunk:
-                canon = canon_by_lower.get(sku.lower())
-                if not canon:
-                    summary["not_found_in_magento"] += 1
-                    if len(not_found_sample) < sample_cap:
-                        not_found_sample.append(sku)
-                    continue
                 to_push.append(
                     {
-                        "sku": canon,
+                        "sku": sku,
                         "source_code": OMS_INVENTORY_SOURCE_CODE,
                         "quantity": merged[sku],
                         "status": OMS_INVENTORY_STATUS,
@@ -940,7 +879,7 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
                 )
                 LOG.debug(
                     "OMS source-item candidate sku=%s qty=%s source=%s status=%s",
-                    canon,
+                    sku,
                     merged[sku],
                     OMS_INVENTORY_SOURCE_CODE,
                     OMS_INVENTORY_STATUS,
@@ -949,6 +888,7 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
             if not to_push:
                 continue
 
+            summary["attempted_to_magento"] += len(to_push)
             try:
                 await _oms_post_source_items(client, to_push)
                 summary["pushed_to_magento"] += len(to_push)
@@ -961,30 +901,63 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
             except httpx.HTTPStatusError as e:
                 summary["api_errors"] += 1
                 LOG.error(
-                    "OMS POST source-items HTTP error status=%s body=%s",
+                    "OMS POST source-items chunk failed status=%s body=%s | retrying each sku",
                     e.response.status_code,
                     (e.response.text or "")[:500],
                 )
+                # Retry one-by-one so one bad SKU does not block all good SKUs in chunk.
+                for item in to_push:
+                    try:
+                        await _oms_post_source_items(client, [item])
+                        summary["pushed_to_magento"] += 1
+                    except httpx.HTTPStatusError as ie:
+                        summary["api_errors"] += 1
+                        summary["failed_to_push"] += 1
+                        if len(failed_sample) < sample_cap:
+                            failed_sample.append(str(item.get("sku")))
+                        LOG.error(
+                            "OMS POST source-item failed sku=%s qty=%s status=%s body=%s",
+                            item.get("sku"),
+                            item.get("quantity"),
+                            ie.response.status_code,
+                            (ie.response.text or "")[:500],
+                        )
+                    except Exception as ie:
+                        summary["api_errors"] += 1
+                        summary["failed_to_push"] += 1
+                        if len(failed_sample) < sample_cap:
+                            failed_sample.append(str(item.get("sku")))
+                        LOG.exception(
+                            "OMS POST source-item failed sku=%s qty=%s: %s",
+                            item.get("sku"),
+                            item.get("quantity"),
+                            ie,
+                        )
             except Exception as e:
                 summary["api_errors"] += 1
+                summary["failed_to_push"] += len(to_push)
+                for item in to_push:
+                    if len(failed_sample) < sample_cap:
+                        failed_sample.append(str(item.get("sku")))
                 LOG.exception("OMS POST source-items failed: %s", e)
 
-    summary["not_found_skus_sample"] = not_found_sample
+    summary["failed_skus_sample"] = failed_sample
     LOG.info(
-        "OMS inventory push done | qb_items=%s skipped_invalid=%s not_found_in_magento=%s "
-        "pushed_to_magento=%s api_errors=%s not_found_sample_first=%s",
+        "OMS inventory push done | qb_items=%s skipped_invalid=%s attempted_to_magento=%s "
+        "pushed_to_magento=%s failed_to_push=%s api_errors=%s failed_sample_first=%s",
         summary["qb_items"],
         summary["skipped_invalid"],
-        summary["not_found_in_magento"],
+        summary["attempted_to_magento"],
         summary["pushed_to_magento"],
+        summary["failed_to_push"],
         summary["api_errors"],
-        len(not_found_sample),
+        len(failed_sample),
     )
-    if not_found_sample:
+    if failed_sample:
         LOG.info(
-            "OMS SKUs not in Magento catalog (sample up to %s): %s",
+            "OMS failed source-items (sample up to %s): %s",
             sample_cap,
-            not_found_sample[:sample_cap],
+            failed_sample[:sample_cap],
         )
     return summary
 
@@ -1522,8 +1495,9 @@ async def qbwc_handler(request: Request):
                 last_inventory_oms_summary = inv_summary
                 print(
                     f"📊 OMS inventory | qb_items={inv_summary.get('qb_items')} "
+                    f"attempted={inv_summary.get('attempted_to_magento')} "
                     f"pushed={inv_summary.get('pushed_to_magento')} "
-                    f"not_found={inv_summary.get('not_found_in_magento')} "
+                    f"failed={inv_summary.get('failed_to_push')} "
                     f"skipped_invalid={inv_summary.get('skipped_invalid')} "
                     f"api_errors={inv_summary.get('api_errors')}"
                 )
