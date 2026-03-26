@@ -1094,7 +1094,25 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     # Sort by priority ascending (1 = highest priority)
     pending.sort(key=lambda x: x["priority"])
     limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
-    return pending[:limit]
+    selected = pending[:limit]
+
+    # Guarantee one inventory pull job is included in this session batch.
+    # Without this, many customer/order jobs can starve inventory indefinitely.
+    has_inventory = any(j.get("operation") == "pull_inventory" for j in selected)
+    if not has_inventory:
+        inv_job = next((j for j in pending if j.get("operation") == "pull_inventory"), None)
+        if inv_job is not None:
+            if len(selected) >= limit and selected:
+                selected[-1] = inv_job
+            else:
+                selected.append(inv_job)
+            LOG.info(
+                "Batch selection forced inventory job id=%s into session (limit=%s selected=%s)",
+                inv_job.get("id"),
+                limit,
+                len(selected),
+            )
+    return selected
 
 
 def enqueue_inventory_pull_job(client_id: str) -> Dict[str, Any]:
