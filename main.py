@@ -1090,6 +1090,29 @@ def get_next_jobs_for_client(client_id: str, max_jobs: Optional[int] = None):
     limit = QBWC_JOB_BATCH_SIZE if max_jobs is None else max(1, max_jobs)
     return pending[:limit]
 
+
+def enqueue_inventory_pull_job(client_id: str) -> Dict[str, Any]:
+    """
+    Always enqueue a fresh inventory pull job so each QBWC session can push latest on-hand qty to Magento.
+    """
+    job = {
+        "id": f"job_inv_{uuid.uuid4().hex[:10]}",
+        "client_id": client_id,
+        "operation": "pull_inventory",
+        "priority": 4,
+        "source": "scheduled",
+        "status": "pending",
+        "k365_id": None,
+        "linked_order": None,
+        "retry_count": 0,
+        "qb_id": None,
+        "payload": {},
+    }
+    job_queue.append(job)
+    LOG.info("Enqueued inventory pull job id=%s client=%s", job["id"], client_id)
+    return job
+
+
 def resolve_dependencies(completed_job_id: str):
     """
     When a customer job completes, unblock any orders waiting for it.
@@ -1155,7 +1178,7 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     )
 
 def build_inventory_xml(request_id: str = "1") -> str:
-    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="{request_id}"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq></QBXMLMsgsRq></QBXML>"""
+    return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="{request_id}"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq><ItemInventoryAssemblyQueryRq requestID="{request_id}_asm"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryAssemblyQueryRq></QBXMLMsgsRq></QBXML>"""
 
 def soap_envelope(method: str, inner: str) -> str:
     return f"""<?xml version="1.0" encoding="utf-8"?>
@@ -1369,6 +1392,9 @@ async def qbwc_handler(request: Request):
                 except Exception as e:
                     print(f"❌ OMS order sync on auth failed (continuing): {e}")
                     LOG.exception("OMS order sync on auth failed (continuing with existing queue): %s", e)
+
+            # Always enqueue one fresh inventory pull per auth so latest QB on-hand can sync to Magento.
+            enqueue_inventory_pull_job(u)
 
             # Load next batch of jobs for this client
             jobs = get_next_jobs_for_client(u)
@@ -1585,14 +1611,17 @@ async def qbwc_handler(request: Request):
 
             elif job["operation"] == "pull_inventory":
                 global last_inventory_pull, last_inventory_oms_summary
-                items = re.findall(
+                inv_items = re.findall(
                     r'<ItemInventoryRet>(.*?)</ItemInventoryRet>', raw, re.DOTALL
                 )
-                print(f"✅ Found {len(items)} inventory items")
-                LOG.info("Inventory query returned %s items", len(items))
+                asm_items = re.findall(
+                    r'<ItemInventoryAssemblyRet>(.*?)</ItemInventoryAssemblyRet>', raw, re.DOTALL
+                )
+                print(f"✅ Found {len(inv_items)} inventory items and {len(asm_items)} assembly items")
+                LOG.info("Inventory query returned inventory=%s assembly=%s items", len(inv_items), len(asm_items))
                 rows: List[Tuple[str, float]] = []
                 parse_skipped = 0
-                for item in items:
+                for item in inv_items + asm_items:
                     name  = re.search(r'<FullName>(.*?)</FullName>', item)
                     price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
                     cost  = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
@@ -1602,8 +1631,18 @@ async def qbwc_handler(request: Request):
                     qty_val = _parse_qb_decimal(qty_txt)
                     if sku_txt.strip() and qty_val is not None:
                         rows.append((sku_txt.strip(), qty_val))
+                        LOG.info(
+                            "QB inventory parsed sku=%r qty=%s",
+                            sku_txt.strip(),
+                            qty_val,
+                        )
                     else:
                         parse_skipped += 1
+                        LOG.warning(
+                            "QB inventory parse skipped sku=%r qty_raw=%r",
+                            sku_txt.strip(),
+                            qty_txt,
+                        )
                     LOG.debug(
                         "QB item sku=%s price=%s cost=%s qty=%s",
                         sku_txt or "N/A",
