@@ -26,24 +26,33 @@ def _setup_logging() -> None:
     log_file = os.getenv("LOG_FILE", "logs/qb-connector.log").strip() or "logs/qb-connector.log"
     root = logging.getLogger()
     root.setLevel(level)
-    if root.handlers:
-        return
+    LOG.setLevel(level)
+
     fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
-    log_dir = os.path.dirname(log_file)
-    if log_dir:
-        os.makedirs(log_dir, mode=0o755, exist_ok=True)
-    try:
-        fh = RotatingFileHandler(
-            log_file, maxBytes=int(os.getenv("LOG_MAX_BYTES", "5242880")), backupCount=int(os.getenv("LOG_BACKUP_COUNT", "3"))
-        )
-        fh.setFormatter(fmt)
-        root.addHandler(fh)
-        LOG.info("File logging enabled: %s", os.path.abspath(log_file))
-    except OSError as e:
-        LOG.warning("Could not open log file %s: %s", log_file, e)
+
+    if not root.handlers:
+        sh = logging.StreamHandler()
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+
+    # Uvicorn/Gunicorn often configure the root logger before import; still add our file log.
+    has_rotating_file = any(type(h).__name__ == "RotatingFileHandler" for h in root.handlers)
+    if not has_rotating_file:
+        log_dir = os.path.dirname(log_file)
+        if log_dir:
+            os.makedirs(log_dir, mode=0o755, exist_ok=True)
+        try:
+            fh = RotatingFileHandler(
+                log_file,
+                maxBytes=int(os.getenv("LOG_MAX_BYTES", "5242880")),
+                backupCount=int(os.getenv("LOG_BACKUP_COUNT", "3")),
+            )
+            fh.setFormatter(fmt)
+            root.addHandler(fh)
+            LOG.info("File logging enabled: %s", os.path.abspath(log_file))
+        except OSError as e:
+            LOG.warning("Could not open log file %s: %s", log_file, e)
+
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -427,6 +436,23 @@ async def sync_customers_from_oms(client_id: str) -> dict:
     return summary
 
 
+def _parse_qb_decimal(raw: Optional[str]) -> Optional[float]:
+    """
+    Parse QuickBooks numeric strings from QBXML (e.g. QuantityOnHand).
+    Strips commas used as thousands separators (e.g. 1,234.56).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s = s.replace(",", "")
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
 def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
@@ -456,8 +482,16 @@ async def _oms_get_products_sku_canonical_map(
     resp = await client.get(url, params=params, headers=headers, timeout=OMS_REQUEST_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()
+    items = list(data.get("items") or [])
+    total_count = int(data.get("total_count") or 0)
+    LOG.info(
+        "OMS GET products sku in | batch_requested=%s items_returned=%s total_count=%s",
+        len(skus),
+        len(items),
+        total_count,
+    )
     canon_by_lower: Dict[str, str] = {}
-    for it in data.get("items") or []:
+    for it in items:
         s = it.get("sku")
         if s is not None and str(s).strip():
             canon = str(s).strip()
@@ -582,6 +616,12 @@ async def push_inventory_source_items_to_oms(rows: List[Tuple[str, float]]) -> D
             try:
                 await _oms_post_source_items(client, to_push)
                 summary["pushed_to_magento"] += len(to_push)
+                sample = to_push[: min(5, len(to_push))]
+                LOG.info(
+                    "OMS POST source-items OK | count=%s sample_qty=%s",
+                    len(to_push),
+                    [(x.get("sku"), x.get("quantity")) for x in sample],
+                )
             except httpx.HTTPStatusError as e:
                 summary["api_errors"] += 1
                 LOG.error(
@@ -1029,10 +1069,7 @@ async def qbwc_handler(request: Request):
                     qty   = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
                     sku_txt = (name.group(1) if name else "") or ""
                     qty_txt = (qty.group(1) if qty else "") or ""
-                    try:
-                        qty_val = float(qty_txt.strip()) if qty_txt.strip() else None
-                    except (TypeError, ValueError):
-                        qty_val = None
+                    qty_val = _parse_qb_decimal(qty_txt)
                     if sku_txt.strip() and qty_val is not None:
                         rows.append((sku_txt.strip(), qty_val))
                     else:
@@ -1044,6 +1081,13 @@ async def qbwc_handler(request: Request):
                         cost.group(1) if cost else "N/A",
                         qty_txt or "N/A",
                     )
+                preview = [(r[0], r[1]) for r in rows[: min(5, len(rows))]]
+                LOG.info(
+                    "QB inventory parsed rows=%s parse_skipped=%s preview_sku_qty=%s",
+                    len(rows),
+                    parse_skipped,
+                    preview,
+                )
                 inv_summary = await push_inventory_source_items_to_oms(rows)
                 inv_summary["skipped_invalid"] = int(inv_summary.get("skipped_invalid") or 0) + parse_skipped
                 last_inventory_oms_summary = inv_summary
