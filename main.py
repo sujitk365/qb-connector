@@ -795,6 +795,24 @@ def _parse_qb_decimal(raw: Optional[str]) -> Optional[float]:
         return None
 
 
+def _qb_decode_xml_text(value: Optional[str]) -> str:
+    """
+    Decode HTML/XML entities in text extracted from QBXML (e.g. FullName).
+    QuickBooks may emit &amp; for '&'; repeat unescape so double-encoded &amp;amp; becomes '&'.
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    for _ in range(5):
+        t = html.unescape(s)
+        if t == s:
+            return t
+        s = t
+    return s
+
+
 def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
@@ -1650,8 +1668,8 @@ async def qbwc_handler(request: Request):
                     price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
                     cost  = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
                     qty   = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
-                    sku_txt = (name.group(1) if name else "") or ""
-                    qty_txt = (qty.group(1) if qty else "") or ""
+                    sku_txt = _qb_decode_xml_text(name.group(1) if name else "")
+                    qty_txt = _qb_decode_xml_text(qty.group(1) if qty else "")
                     qty_val = _parse_qb_decimal(qty_txt)
                     if sku_txt.strip() and qty_val is not None:
                         rows.append((sku_txt.strip(), qty_val))
