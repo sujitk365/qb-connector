@@ -95,11 +95,6 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
-# QuickBooks Desktop custom field label on Sales Order (must match Company > Custom Fields). Empty = omit DataExt.
-QB_ORDER_ID_CUSTOM_FIELD = (os.getenv("QB_ORDER_ID_CUSTOM_FIELD") or "Order Id").strip()
-# Persist Magento order entity_ids that already synced so restarts do not enqueue duplicates (in-memory transaction_map alone resets).
-OMS_SYNCED_ORDERS_STATE_PATH = (os.getenv("OMS_SYNCED_ORDERS_STATE_PATH") or "logs/qb_sync_state.json").strip()
-
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -192,48 +187,6 @@ job_queue = [
         "payload": {}
     }
 ]
-
-
-def _synced_orders_state_path_resolved() -> str:
-    return OMS_SYNCED_ORDERS_STATE_PATH or "logs/qb_sync_state.json"
-
-
-def _load_synced_order_entity_ids_from_disk() -> set:
-    path = _synced_orders_state_path_resolved()
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        ids = data.get("synced_order_entity_ids") or []
-        return {str(x).strip() for x in ids if x is not None and str(x).strip()}
-    except (OSError, json.JSONDecodeError, TypeError):
-        return set()
-
-
-def _persist_synced_order_entity_ids() -> None:
-    path = _synced_orders_state_path_resolved()
-    try:
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, mode=0o755, exist_ok=True)
-        data = {"synced_order_entity_ids": sorted(synced_order_entity_ids)}
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(tmp, path)
-    except OSError as e:
-        LOG.warning("Could not persist synced order ids to %s: %s", path, e)
-
-
-def _record_synced_order_entity_id(entity_id: str) -> None:
-    sid = str(entity_id).strip()
-    if not sid or sid in synced_order_entity_ids:
-        return
-    synced_order_entity_ids.add(sid)
-    _persist_synced_order_entity_ids()
-
-
-# Magento entity_ids already pushed to QB (persisted so restarts do not re-enqueue the same order).
-synced_order_entity_ids: set = _load_synced_order_entity_ids_from_disk()
 
 
 # ── OMS / Magento customer sync ─────────────────────────────────────────────
@@ -1732,7 +1685,6 @@ async def qbwc_handler(request: Request):
                     qb_txn_id = txn_id.group(1)
                     update_job(job["id"], status="completed", qb_id=qb_txn_id)
                     transaction_map[f"order:{job['k365_id']}"] = qb_txn_id
-                    _record_synced_order_entity_id(str(job.get("k365_id") or ""))
                     print(f"✅ Order created! TxnID: {qb_txn_id}")
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
