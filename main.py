@@ -95,6 +95,8 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
+# QuickBooks Desktop custom field label on Sales Order (must match Company > Custom Fields). Empty = omit DataExt.
+QB_ORDER_ID_CUSTOM_FIELD = (os.getenv("QB_ORDER_ID_CUSTOM_FIELD") or "Order Id").strip()
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
