@@ -95,6 +95,10 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
+# QuickBooks Desktop custom field label on Sales Order (must match Company > Custom Fields). Empty = omit DataExt.
+QB_ORDER_ID_CUSTOM_FIELD = (os.getenv("QB_ORDER_ID_CUSTOM_FIELD") or "Order Id").strip()
+# Persist Magento order entity_ids that already synced so restarts do not enqueue duplicates (in-memory transaction_map alone resets).
+OMS_SYNCED_ORDERS_STATE_PATH = (os.getenv("OMS_SYNCED_ORDERS_STATE_PATH") or "logs/qb_sync_state.json").strip()
 
 
 @asynccontextmanager
@@ -188,6 +192,48 @@ job_queue = [
         "payload": {}
     }
 ]
+
+
+def _synced_orders_state_path_resolved() -> str:
+    return OMS_SYNCED_ORDERS_STATE_PATH or "logs/qb_sync_state.json"
+
+
+def _load_synced_order_entity_ids_from_disk() -> set:
+    path = _synced_orders_state_path_resolved()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ids = data.get("synced_order_entity_ids") or []
+        return {str(x).strip() for x in ids if x is not None and str(x).strip()}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return set()
+
+
+def _persist_synced_order_entity_ids() -> None:
+    path = _synced_orders_state_path_resolved()
+    try:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, mode=0o755, exist_ok=True)
+        data = {"synced_order_entity_ids": sorted(synced_order_entity_ids)}
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except OSError as e:
+        LOG.warning("Could not persist synced order ids to %s: %s", path, e)
+
+
+def _record_synced_order_entity_id(entity_id: str) -> None:
+    sid = str(entity_id).strip()
+    if not sid or sid in synced_order_entity_ids:
+        return
+    synced_order_entity_ids.add(sid)
+    _persist_synced_order_entity_ids()
+
+
+# Magento entity_ids already pushed to QB (persisted so restarts do not re-enqueue the same order).
+synced_order_entity_ids: set = _load_synced_order_entity_ids_from_disk()
 
 
 # ── OMS / Magento customer sync ─────────────────────────────────────────────
@@ -468,6 +514,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
     errors: List[str] = []
 
     entity_id = order.get("entity_id")
+    oms_entity_id = str(entity_id).strip() if entity_id is not None else ""
     increment_id = str(order.get("increment_id") or entity_id or "").strip()
     po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
@@ -512,6 +559,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "txn_date": txn_date,
         "po_number": po_number,
         "increment_id": increment_id,
+        "oms_entity_id": oms_entity_id,
         "lines": lines,
     }
     return payload, errors
@@ -657,6 +705,11 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             continue
         kid = str(entity_id)
 
+        if kid in synced_order_entity_ids:
+            summary["skipped"] += 1
+            LOG.info("Skip enqueue: OMS order entity_id=%s already synced (persisted Order Id)", kid)
+            continue
+
         if transaction_map.get(f"order:{kid}"):
             summary["skipped"] += 1
             LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
@@ -693,8 +746,9 @@ async def sync_orders_from_oms(client_id: str) -> dict:
         job_queue.append(job)
         summary["enqueued"] += 1
         LOG.info(
-            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+            "Enqueued push_order from OMS order_id=%s oms_entity_id=%s po=%s customer=%s lines=%s",
             kid,
+            payload.get("oms_entity_id"),
             payload.get("po_number"),
             payload.get("customer_name"),
             len(payload.get("lines") or []),
@@ -1256,13 +1310,22 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
+    oms_entity_raw = str(payload.get("oms_entity_id") or "").strip()
+    order_id_ext_xml = ""
+    if QB_ORDER_ID_CUSTOM_FIELD and oms_entity_raw:
+        fn_xml = _qb_text_escape(QB_ORDER_ID_CUSTOM_FIELD)
+        val_xml = _qb_text_escape(oms_entity_raw)
+        order_id_ext_xml = (
+            f"<DataExt><OwnerID>0</OwnerID><DataExtName>{fn_xml}</DataExtName>"
+            f"<DataExtValue>{val_xml}</DataExtValue></DataExt>"
+        )
     return (
         '<?xml version="1.0" ?><?qbxml version="13.0"?>'
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
-        f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
+        f"{order_id_ext_xml}{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
 def build_inventory_xml(request_id: str = "1") -> str:
@@ -1574,9 +1637,10 @@ async def qbwc_handler(request: Request):
                 qbxml = build_order_xml(job["payload"], request_id=job["id"])
                 print(f"🛒 Pushing order: {job['payload']['po_number']}")
                 LOG.info(
-                    "Pushing order job=%s order_id=%s po=%s customer=%s lines=%s",
+                    "Pushing order job=%s order_id=%s oms_entity_id=%s po=%s customer=%s lines=%s",
                     job["id"],
                     job.get("k365_id"),
+                    job["payload"].get("oms_entity_id"),
                     job["payload"].get("po_number"),
                     job["payload"].get("customer_name"),
                     len(job["payload"].get("lines") or []),
@@ -1668,6 +1732,7 @@ async def qbwc_handler(request: Request):
                     qb_txn_id = txn_id.group(1)
                     update_job(job["id"], status="completed", qb_id=qb_txn_id)
                     transaction_map[f"order:{job['k365_id']}"] = qb_txn_id
+                    _record_synced_order_entity_id(str(job.get("k365_id") or ""))
                     print(f"✅ Order created! TxnID: {qb_txn_id}")
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
