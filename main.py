@@ -1,11 +1,9 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, PlainTextResponse
-import asyncio
 import html
 import json
 import logging
 import os
-import threading
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -97,12 +95,6 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
-# Persist Magento orders already pushed to QuickBooks (survives multi-worker / restart; in-memory queue is not shared).
-_default_log = os.getenv("LOG_FILE", "logs/qb-connector.log").strip() or "logs/qb-connector.log"
-_default_sync_dir = os.path.dirname(_default_log) or "logs"
-QB_ORDER_SYNC_STATE_FILE = (os.getenv("QB_ORDER_SYNC_STATE_FILE") or "").strip() or os.path.join(
-    _default_sync_dir, "qb_order_sync_state.json"
-)
 
 
 @asynccontextmanager
@@ -114,7 +106,6 @@ async def _lifespan(app: FastAPI):
         OMS_SYNC_ON_AUTH,
         QBWC_JOB_BATCH_SIZE,
     )
-    _hydrate_order_transaction_map_from_disk()
     yield
     print("🛑 QB Connector shutting down")
     LOG.info("QB Connector shutting down")
@@ -134,11 +125,6 @@ sessions = {}          # { ticket: { client_id, jobs, index, total } }
 transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
 last_inventory_pull: Optional[datetime] = None
 last_inventory_oms_summary: Optional[Dict[str, Any]] = None
-
-# Serialize OMS order sync so concurrent auth/manual sync cannot enqueue the same order twice.
-_sync_orders_lock = asyncio.Lock()
-# Disk-backed order sync state (shared across workers / restarts).
-_order_sync_disk_lock = threading.Lock()
 
 # ── POC Job Queue (simulates MySQL qb_sync_queue) ────────────────────────────
 # In production these would come from MySQL.
@@ -356,160 +342,28 @@ def _oms_customer_job_completed_for(k365_id: str) -> bool:
     return False
 
 
-def _order_sync_state_path() -> str:
-    p = QB_ORDER_SYNC_STATE_FILE.strip() or os.path.join("logs", "qb_order_sync_state.json")
-    d = os.path.dirname(p)
-    if d:
-        os.makedirs(d, mode=0o755, exist_ok=True)
-    return p
-
-
-def _build_increment_index_from_orders(orders: Dict[str, Any]) -> Dict[str, str]:
-    """increment_id -> entity_id for duplicate detection."""
-    idx: Dict[str, str] = {}
-    for eid, meta in orders.items():
-        if not isinstance(meta, dict):
-            continue
-        inc = str(meta.get("increment_id") or "").strip()
-        if inc:
-            idx[inc] = str(eid)
-    return idx
-
-
-def _load_order_sync_state() -> Dict[str, Any]:
-    path = _order_sync_state_path()
-    if not os.path.isfile(path):
-        return {"version": 1, "orders": {}, "increment_index": {}}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"version": 1, "orders": {}, "increment_index": {}}
-        data.setdefault("version", 1)
-        data.setdefault("orders", {})
-        if not isinstance(data["orders"], dict):
-            data["orders"] = {}
-        if not data.get("increment_index") and data["orders"]:
-            data["increment_index"] = _build_increment_index_from_orders(data["orders"])
-        data.setdefault("increment_index", {})
-        return data
-    except Exception as e:
-        LOG.warning("Could not read order sync state %s: %s", path, e)
-        return {"version": 1, "orders": {}, "increment_index": {}}
-
-
-def _save_order_sync_state(state: Dict[str, Any]) -> None:
-    path = _order_sync_state_path()
-    state = dict(state)
-    orders = state.setdefault("orders", {})
-    if not isinstance(orders, dict):
-        orders = {}
-        state["orders"] = orders
-    state["increment_index"] = _build_increment_index_from_orders(orders)
-    state["version"] = 1
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-    os.replace(tmp, path)
-
-
-def _hydrate_order_transaction_map_from_disk() -> None:
-    """Restore order:entity_id -> TxnID into transaction_map after restart."""
-    with _order_sync_disk_lock:
-        st = _load_order_sync_state()
-    n = 0
-    for eid, meta in (st.get("orders") or {}).items():
-        if isinstance(meta, dict) and meta.get("txn_id"):
-            transaction_map[f"order:{eid}"] = meta["txn_id"]
-            n += 1
-    if n:
-        LOG.info("Hydrated %s order TxnIDs from disk (%s)", n, _order_sync_state_path())
-
-
-def _persist_order_synced_to_disk(
-    entity_id: str, increment_id: str, txn_id: str, ref_number: Optional[str] = None
-) -> None:
-    """Record a successful QuickBooks SalesOrder so other workers / future syncs skip this order."""
-    eid = str(entity_id)
-    inc = str(increment_id or "").strip()
-    with _order_sync_disk_lock:
-        state = _load_order_sync_state()
-        orders = state.setdefault("orders", {})
-        orders[eid] = {
-            "txn_id": txn_id,
-            "increment_id": inc,
-            "ref_number": (str(ref_number).strip() if ref_number else None),
-            "synced_at": datetime.utcnow().isoformat() + "Z",
-        }
-        _save_order_sync_state(state)
-    LOG.info(
-        "Persisted synced order to disk entity_id=%s increment_id=%s txn_id=%s file=%s",
-        eid,
-        inc or "(none)",
-        txn_id,
-        _order_sync_state_path(),
-    )
-
-
-def _oms_order_already_synced_or_queued(
-    k365_id: str,
-    increment_id: str = "",
-    disk_orders: Optional[Dict[str, Any]] = None,
-    disk_increment_index: Optional[Dict[str, str]] = None,
-) -> bool:
-    """
-    True if this Magento order should not be enqueued again:
-    - On disk (multi-worker / restart safe)
-    - In transaction_map (this process)
-    - Any push_order job in job_queue for this entity_id (any status)
-    """
+def _oms_order_job_pending_for(k365_id: str) -> bool:
     kid = str(k365_id)
-    inc = str(increment_id or "").strip()
-
-    if disk_orders is None or disk_increment_index is None:
-        with _order_sync_disk_lock:
-            st = _load_order_sync_state()
-        disk_orders = st.get("orders") or {}
-        disk_increment_index = st.get("increment_index") or {}
-        if not disk_increment_index and disk_orders:
-            disk_increment_index = _build_increment_index_from_orders(disk_orders)
-
-    if kid in disk_orders:
-        return True
-    if inc and inc in disk_increment_index:
-        LOG.debug(
-            "Skip enqueue: increment_id=%s already on disk (entity_id=%s)",
-            inc,
-            disk_increment_index.get(inc),
-        )
-        return True
-
-    if transaction_map.get(f"order:{kid}"):
-        return True
     for j in job_queue:
         if j.get("operation") != "push_order":
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        return True
+        if j["status"] in ("pending", "processing", "hold", "failed"):
+            return True
     return False
 
 
-def _dedupe_oms_orders_by_entity_id(orders: List) -> List:
-    """Keep first occurrence per entity_id; OMS pagination can occasionally repeat rows."""
-    seen = set()
-    out: List = []
-    for order in orders:
-        eid = order.get("entity_id")
-        if eid is None:
-            out.append(order)
+def _oms_order_job_completed_for(k365_id: str) -> bool:
+    kid = str(k365_id)
+    for j in job_queue:
+        if j.get("operation") != "push_order":
             continue
-        if eid in seen:
-            LOG.warning("OMS orders list: duplicate entity_id=%s dropped", eid)
+        if str(j.get("k365_id")) != kid:
             continue
-        seen.add(eid)
-        out.append(order)
-    return out
+        if j["status"] == "completed":
+            return True
+    return False
 
 
 async def fetch_oms_customers_page(
@@ -794,75 +648,57 @@ async def sync_orders_from_oms(client_id: str) -> dict:
         LOG.error("sync_orders_from_oms aborted: %s", e)
         return summary
 
-    async with _sync_orders_lock:
-        with _order_sync_disk_lock:
-            disk_st = _load_order_sync_state()
-        disk_orders = disk_st.get("orders") or {}
-        disk_inc_idx = disk_st.get("increment_index") or {}
-        if not disk_inc_idx and disk_orders:
-            disk_inc_idx = _build_increment_index_from_orders(disk_orders)
+    summary["fetched"] = len(orders)
+    for order in orders:
+        entity_id = order.get("entity_id")
+        if entity_id is None:
+            summary["skipped"] += 1
+            LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
+            continue
+        kid = str(entity_id)
 
-        raw_count = len(orders)
-        orders = _dedupe_oms_orders_by_entity_id(orders)
-        if len(orders) < raw_count:
-            LOG.info(
-                "OMS order sync deduped list: raw=%s unique_entity=%s",
-                raw_count,
-                len(orders),
-            )
+        if transaction_map.get(f"order:{kid}"):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
+            continue
+        if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
+            summary["skipped"] += 1
+            LOG.debug("Skip enqueue: order %s already in job_queue", kid)
+            continue
 
-        summary["fetched"] = len(orders)
-        for order in orders:
-            entity_id = order.get("entity_id")
-            if entity_id is None:
-                summary["skipped"] += 1
-                LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
-                continue
-            kid = str(entity_id)
-            inc = str(order.get("increment_id") or "").strip()
-
-            if _oms_order_already_synced_or_queued(kid, inc, disk_orders, disk_inc_idx):
-                summary["skipped"] += 1
-                LOG.debug(
-                    "Skip enqueue: order %s increment_id=%s (disk/transaction_map/queue)",
-                    kid,
-                    inc or "-",
-                )
-                continue
-
-            payload, payload_errors = magento_order_to_payload(order)
-            if payload_errors:
-                summary["validation_failed"] += 1
-                LOG.error(
-                    "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
-                    kid,
-                    payload.get("increment_id"),
-                    payload_errors,
-                )
-                continue
-
-            job = {
-                "id": f"oms_order_{kid}",
-                "client_id": client_id,
-                "operation": "push_order",
-                "priority": 2,
-                "source": "oms_api",
-                "status": "pending",
-                "k365_id": kid,
-                "linked_order": None,
-                "retry_count": 0,
-                "qb_id": None,
-                "payload": payload,
-            }
-            job_queue.append(job)
-            summary["enqueued"] += 1
-            LOG.info(
-                "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+        payload, payload_errors = magento_order_to_payload(order)
+        if payload_errors:
+            summary["validation_failed"] += 1
+            LOG.error(
+                "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
                 kid,
-                payload.get("po_number"),
-                payload.get("customer_name"),
-                len(payload.get("lines") or []),
+                payload.get("increment_id"),
+                payload_errors,
             )
+            continue
+
+        job = {
+            "id": f"oms_order_{kid}",
+            "client_id": client_id,
+            "operation": "push_order",
+            "priority": 2,
+            "source": "oms_api",
+            "status": "pending",
+            "k365_id": kid,
+            "linked_order": None,
+            "retry_count": 0,
+            "qb_id": None,
+            "payload": payload,
+        }
+        job_queue.append(job)
+        summary["enqueued"] += 1
+        LOG.info(
+            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+            kid,
+            payload.get("po_number"),
+            payload.get("customer_name"),
+            len(payload.get("lines") or []),
+        )
 
     print(
         f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
@@ -1499,9 +1335,6 @@ def _detect_soap_action(body_str: str, soap_action_header: str) -> str:
 # ── Status endpoint (simple dashboard) ──────────────────────────────────────
 @app.get("/status")
 async def status():
-    with _order_sync_disk_lock:
-        st_disk = _load_order_sync_state()
-    n_disk = len((st_disk.get("orders") or {}))
     return {
         "queue": [
             {
@@ -1517,8 +1350,6 @@ async def status():
             for j in job_queue
         ],
         "transaction_map": transaction_map,
-        "synced_orders_count": n_disk,
-        "synced_orders_state_file": _order_sync_state_path(),
         "active_sessions": list(sessions.keys()),
         "last_inventory_pull": str(last_inventory_pull) if last_inventory_pull else "never",
         "last_inventory_oms_summary": last_inventory_oms_summary,
@@ -1837,13 +1668,6 @@ async def qbwc_handler(request: Request):
                     qb_txn_id = txn_id.group(1)
                     update_job(job["id"], status="completed", qb_id=qb_txn_id)
                     transaction_map[f"order:{job['k365_id']}"] = qb_txn_id
-                    pl = job.get("payload") or {}
-                    inc_saved = str(pl.get("increment_id") or "").strip()
-                    ref_str = ref_num.group(1).strip() if ref_num else None
-                    try:
-                        _persist_order_synced_to_disk(job["k365_id"], inc_saved, qb_txn_id, ref_str)
-                    except OSError as e:
-                        LOG.error("Could not persist order sync state to disk: %s", e)
                     print(f"✅ Order created! TxnID: {qb_txn_id}")
                     print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
                     LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
