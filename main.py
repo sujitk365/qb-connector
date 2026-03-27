@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, PlainTextResponse
+import asyncio
 import html
 import json
 import logging
@@ -125,6 +126,9 @@ sessions = {}          # { ticket: { client_id, jobs, index, total } }
 transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
 last_inventory_pull: Optional[datetime] = None
 last_inventory_oms_summary: Optional[Dict[str, Any]] = None
+
+# Serialize OMS order sync so concurrent auth/manual sync cannot enqueue the same order twice.
+_sync_orders_lock = asyncio.Lock()
 
 # ── POC Job Queue (simulates MySQL qb_sync_queue) ────────────────────────────
 # In production these would come from MySQL.
@@ -342,28 +346,39 @@ def _oms_customer_job_completed_for(k365_id: str) -> bool:
     return False
 
 
-def _oms_order_job_pending_for(k365_id: str) -> bool:
+def _oms_order_already_synced_or_queued(k365_id: str) -> bool:
+    """
+    True if this Magento order entity_id is already in QB (transaction_map) or has any
+    push_order job in the queue (any status). Prevents duplicate enqueue on concurrent
+    syncs, repeated OMS rows, or a dead job still present (which previously could re-enqueue).
+    """
     kid = str(k365_id)
+    if transaction_map.get(f"order:{kid}"):
+        return True
     for j in job_queue:
         if j.get("operation") != "push_order":
             continue
         if str(j.get("k365_id")) != kid:
             continue
-        if j["status"] in ("pending", "processing", "hold", "failed"):
-            return True
+        return True
     return False
 
 
-def _oms_order_job_completed_for(k365_id: str) -> bool:
-    kid = str(k365_id)
-    for j in job_queue:
-        if j.get("operation") != "push_order":
+def _dedupe_oms_orders_by_entity_id(orders: List) -> List:
+    """Keep first occurrence per entity_id; OMS pagination can occasionally repeat rows."""
+    seen = set()
+    out: List = []
+    for order in orders:
+        eid = order.get("entity_id")
+        if eid is None:
+            out.append(order)
             continue
-        if str(j.get("k365_id")) != kid:
+        if eid in seen:
+            LOG.warning("OMS orders list: duplicate entity_id=%s dropped", eid)
             continue
-        if j["status"] == "completed":
-            return True
-    return False
+        seen.add(eid)
+        out.append(order)
+    return out
 
 
 async def fetch_oms_customers_page(
@@ -648,57 +663,66 @@ async def sync_orders_from_oms(client_id: str) -> dict:
         LOG.error("sync_orders_from_oms aborted: %s", e)
         return summary
 
-    summary["fetched"] = len(orders)
-    for order in orders:
-        entity_id = order.get("entity_id")
-        if entity_id is None:
-            summary["skipped"] += 1
-            LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
-            continue
-        kid = str(entity_id)
-
-        if transaction_map.get(f"order:{kid}"):
-            summary["skipped"] += 1
-            LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
-            continue
-        if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
-            summary["skipped"] += 1
-            LOG.debug("Skip enqueue: order %s already in job_queue", kid)
-            continue
-
-        payload, payload_errors = magento_order_to_payload(order)
-        if payload_errors:
-            summary["validation_failed"] += 1
-            LOG.error(
-                "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
-                kid,
-                payload.get("increment_id"),
-                payload_errors,
+    async with _sync_orders_lock:
+        raw_count = len(orders)
+        orders = _dedupe_oms_orders_by_entity_id(orders)
+        if len(orders) < raw_count:
+            LOG.info(
+                "OMS order sync deduped list: raw=%s unique_entity=%s",
+                raw_count,
+                len(orders),
             )
-            continue
 
-        job = {
-            "id": f"oms_order_{kid}",
-            "client_id": client_id,
-            "operation": "push_order",
-            "priority": 2,
-            "source": "oms_api",
-            "status": "pending",
-            "k365_id": kid,
-            "linked_order": None,
-            "retry_count": 0,
-            "qb_id": None,
-            "payload": payload,
-        }
-        job_queue.append(job)
-        summary["enqueued"] += 1
-        LOG.info(
-            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
-            kid,
-            payload.get("po_number"),
-            payload.get("customer_name"),
-            len(payload.get("lines") or []),
-        )
+        summary["fetched"] = len(orders)
+        for order in orders:
+            entity_id = order.get("entity_id")
+            if entity_id is None:
+                summary["skipped"] += 1
+                LOG.warning("OMS order missing entity_id, skipping raw keys=%s", list(order.keys())[:10])
+                continue
+            kid = str(entity_id)
+
+            if _oms_order_already_synced_or_queued(kid):
+                summary["skipped"] += 1
+                LOG.debug(
+                    "Skip enqueue: order %s already synced (transaction_map) or has push_order job",
+                    kid,
+                )
+                continue
+
+            payload, payload_errors = magento_order_to_payload(order)
+            if payload_errors:
+                summary["validation_failed"] += 1
+                LOG.error(
+                    "OMS order validation failed entity_id=%s increment_id=%s errors=%s",
+                    kid,
+                    payload.get("increment_id"),
+                    payload_errors,
+                )
+                continue
+
+            job = {
+                "id": f"oms_order_{kid}",
+                "client_id": client_id,
+                "operation": "push_order",
+                "priority": 2,
+                "source": "oms_api",
+                "status": "pending",
+                "k365_id": kid,
+                "linked_order": None,
+                "retry_count": 0,
+                "qb_id": None,
+                "payload": payload,
+            }
+            job_queue.append(job)
+            summary["enqueued"] += 1
+            LOG.info(
+                "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
+                kid,
+                payload.get("po_number"),
+                payload.get("customer_name"),
+                len(payload.get("lines") or []),
+            )
 
     print(
         f"✅ OMS order sync done | fetched={summary['fetched']} enqueued={summary['enqueued']} skipped={summary['skipped']} validation_failed={summary['validation_failed']}"
