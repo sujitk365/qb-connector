@@ -813,6 +813,52 @@ def _qb_decode_xml_text(value: Optional[str]) -> str:
     return s
 
 
+def _qb_xml_tag_decimal(item_xml: str, tag: str) -> Optional[float]:
+    m = re.search(
+        rf"<{re.escape(tag)}>(.*?)</{re.escape(tag)}>", item_xml, re.DOTALL | re.IGNORECASE
+    )
+    if not m:
+        return None
+    return _parse_qb_decimal(_qb_decode_xml_text(m.group(1)))
+
+
+def _qb_item_available_qty(
+    item_xml: str,
+) -> Tuple[Optional[float], Optional[float], float, float]:
+    """
+    Quantity for Magento = QuickBooks **Quantity available** (not Quantity on hand).
+
+    If QBXML includes ``QuantityAvailable``, that value is used (matches Inventory Center when present).
+
+    Otherwise: max(0, QuantityOnHand - QuantityOnSalesOrder - reserved), where reserved tries
+    common Enterprise tags for "Reserved for assemblies" / pending build.
+    """
+    on_hand = _qb_xml_tag_decimal(item_xml, "QuantityOnHand")
+    on_so = _qb_xml_tag_decimal(item_xml, "QuantityOnSalesOrder")
+    if on_so is None:
+        on_so = _qb_xml_tag_decimal(item_xml, "QuantityOnSalesOrders")
+    if on_so is None:
+        on_so = 0.0
+
+    reserved = _qb_xml_tag_decimal(item_xml, "QuantityReservedForAssemblies")
+    if reserved is None:
+        reserved = _qb_xml_tag_decimal(item_xml, "QuantityOnPendingBuild")
+    if reserved is None:
+        reserved = _qb_xml_tag_decimal(item_xml, "QuantityReserved")
+    if reserved is None:
+        reserved = 0.0
+
+    direct = _qb_xml_tag_decimal(item_xml, "QuantityAvailable")
+    if direct is not None:
+        return float(direct), on_hand, float(on_so), float(reserved)
+
+    if on_hand is None:
+        return None, None, float(on_so), float(reserved)
+
+    avail = max(0.0, float(on_hand) - float(on_so) - float(reserved))
+    return avail, float(on_hand), float(on_so), float(reserved)
+
+
 def _chunk_list(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
@@ -877,7 +923,7 @@ async def push_inventory_source_items_to_oms(
     """
     POST source-items directly to Magento (no catalog pre-check).
     On chunk failure, retry each SKU individually to isolate bad items.
-    rows: (sku from QB FullName, quantity) — merged by sku (last wins).
+    rows: (sku from QB FullName, quantity) — quantity is QB **Quantity available** (never raw QuantityOnHand), merged by sku (last wins).
     qb_job_id: QBWC job id for log correlation (same style as order/customer logs).
     """
     summary: Dict[str, Any] = {
@@ -1667,30 +1713,37 @@ async def qbwc_handler(request: Request):
                     name  = re.search(r'<FullName>(.*?)</FullName>', item)
                     price = re.search(r'<SalesPrice>(.*?)</SalesPrice>', item)
                     cost  = re.search(r'<PurchaseCost>(.*?)</PurchaseCost>', item)
-                    qty   = re.search(r'<QuantityOnHand>(.*?)</QuantityOnHand>', item)
                     sku_txt = _qb_decode_xml_text(name.group(1) if name else "")
-                    qty_txt = _qb_decode_xml_text(qty.group(1) if qty else "")
-                    qty_val = _parse_qb_decimal(qty_txt)
+                    qty_val, on_hand, on_so, reserved_asm = _qb_item_available_qty(item)
                     if sku_txt.strip() and qty_val is not None:
                         rows.append((sku_txt.strip(), qty_val))
                         LOG.info(
-                            "QB inventory parsed sku=%r qty=%s",
+                            "QB inventory parsed sku=%r qty_available=%s (on_hand=%s on_sales_order=%s reserved_asm=%s) -> Magento",
                             sku_txt.strip(),
                             qty_val,
+                            on_hand,
+                            on_so,
+                            reserved_asm,
                         )
                     else:
                         parse_skipped += 1
                         LOG.warning(
-                            "QB inventory parse skipped sku=%r qty_raw=%r",
+                            "QB inventory parse skipped sku=%r qty_available=%s on_hand=%s on_sales_order=%s reserved_asm=%s",
                             sku_txt.strip(),
-                            qty_txt,
+                            qty_val,
+                            on_hand,
+                            on_so,
+                            reserved_asm,
                         )
                     LOG.debug(
-                        "QB item sku=%s price=%s cost=%s qty=%s",
+                        "QB item sku=%s price=%s cost=%s qty_available=%s on_hand=%s on_sales_order=%s reserved_asm=%s",
                         sku_txt or "N/A",
                         price.group(1) if price else "N/A",
                         cost.group(1) if cost else "N/A",
-                        qty_txt or "N/A",
+                        qty_val,
+                        on_hand,
+                        on_so,
+                        reserved_asm,
                     )
                 preview = [(r[0], r[1]) for r in rows[: min(5, len(rows))]]
                 LOG.info(
