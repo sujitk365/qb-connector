@@ -658,11 +658,6 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             continue
         kid = str(entity_id)
 
-        if kid in synced_order_entity_ids:
-            summary["skipped"] += 1
-            LOG.info("Skip enqueue: OMS order entity_id=%s already synced (persisted Order Id)", kid)
-            continue
-
         if transaction_map.get(f"order:{kid}"):
             summary["skipped"] += 1
             LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
