@@ -95,6 +95,10 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
+# Sales Order custom field DataExtName in QuickBooks (must match the field label in QB exactly).
+QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME = (
+    os.getenv("QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME") or "ORDER ID"
+).strip()
 
 
 @asynccontextmanager
@@ -512,6 +516,7 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "txn_date": txn_date,
         "po_number": po_number,
         "increment_id": increment_id,
+        "entity_id": str(entity_id).strip() if entity_id is not None else "",
         "lines": lines,
     }
     return payload, errors
@@ -1256,13 +1261,22 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
+    order_id_xml = ""
+    entity_id_str = str(payload.get("entity_id") or "").strip()
+    if entity_id_str and QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME:
+        ext_name = _qb_text_escape(QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME)
+        ext_val = _qb_text_escape(entity_id_str)
+        order_id_xml = (
+            f"<DataExt><DataExtName>{ext_name}</DataExtName>"
+            f"<DataExtValue>{ext_val}</DataExtValue></DataExt>"
+        )
     return (
         '<?xml version="1.0" ?><?qbxml version="13.0"?>'
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
-        f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
+        f"{order_id_xml}{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
 def build_inventory_xml(request_id: str = "1") -> str:
