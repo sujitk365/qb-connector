@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import uuid
-import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -200,72 +199,6 @@ job_queue = [
 def _qb_text_escape(value: Any) -> str:
     """Escape text for QBXML character data."""
     return xml_escape(str(value if value is not None else ""), entities={'"': "&quot;", "'": "&apos;"})
-
-
-def _soap_local_tag(tag: str) -> str:
-    return tag.split("}")[-1] if "}" in tag else tag
-
-
-def _qbwc_extract_ticket(body_str: str) -> str:
-    """Session ticket from QBWC SOAP (handles optional xmlns prefix and strTicket)."""
-    if not body_str:
-        return ""
-    data = body_str.lstrip("\ufeff")
-    try:
-        root = ET.fromstring(data)
-        for elem in root.iter():
-            local = _soap_local_tag(elem.tag).lower()
-            if local in ("ticket", "strticket") and elem.text:
-                t = elem.text.strip()
-                if t:
-                    return t
-    except ET.ParseError:
-        pass
-    tm = re.search(
-        r"<(?:[^:>\s]+:)?(?:ticket|strticket)\b[^>]*>(.*?)</(?:[^:>\s]+:)?(?:ticket|strticket)\b[^>]*>",
-        data,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if tm:
-        return html.unescape(tm.group(1).strip())
-    return ""
-
-
-def _qbwc_parse_receive_response_body(body_str: str) -> Tuple[str, str]:
-    """Extract (ticket, qbXML string) from receiveResponseXML SOAP body."""
-    if not body_str:
-        return "", ""
-    data = body_str.lstrip("\ufeff")
-    ticket = ""
-    qbxml: Optional[str] = None
-    try:
-        root = ET.fromstring(data)
-        for elem in root.iter():
-            local = _soap_local_tag(elem.tag).lower()
-            if local in ("ticket", "strticket") and elem.text:
-                t = elem.text.strip()
-                if t:
-                    ticket = t
-            elif local in ("response", "strresponse", "strhcpresponse"):
-                qbxml = "".join(elem.itertext()).strip()
-                break
-    except ET.ParseError:
-        pass
-    if qbxml is None:
-        for pat in (
-            r"<(?:[^:>\s]+:)?strHCPResponse\b[^>]*>(.*?)</(?:[^:>\s]+:)?strHCPResponse\b[^>]*>",
-            r"<(?:[^:>\s]+:)?strResponse\b[^>]*>(.*?)</(?:[^:>\s]+:)?strResponse\b[^>]*>",
-            r"<(?:[^:>\s]+:)?response\b[^>]*>(.*?)</(?:[^:>\s]+:)?response\b[^>]*>",
-        ):
-            rm = re.search(pat, data, re.DOTALL | re.IGNORECASE)
-            if rm:
-                qbxml = html.unescape(rm.group(1).strip())
-                break
-    if qbxml is None:
-        qbxml = ""
-    if not ticket:
-        ticket = _qbwc_extract_ticket(data)
-    return ticket, qbxml
 
 
 def _parse_qbxml_status(raw: str, response_rs_names: Optional[List[str]] = None) -> Tuple[str, str, str]:
@@ -1343,7 +1276,7 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
-        f"{lines_xml}{order_id_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
+        f"{order_id_xml}{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
 def build_inventory_xml(request_id: str = "1") -> str:
@@ -1622,7 +1555,8 @@ async def qbwc_handler(request: Request):
 
     # ── sendRequestXML ─────────────────────────────────────────
     elif soap_action == "sendRequestXML" or "sendRequestXML" in body_str:
-        ticket = _qbwc_extract_ticket(body_str)
+        ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
+        ticket = ticket_match.group(1) if ticket_match else ""
         session = sessions.get(ticket)
 
         if not session or session["index"] >= session["total"]:
@@ -1676,20 +1610,24 @@ async def qbwc_handler(request: Request):
 
     # ── receiveResponseXML ─────────────────────────────────────
     elif soap_action == "receiveResponseXML" or "receiveResponseXML" in body_str:
-        ticket, raw_qb = _qbwc_parse_receive_response_body(body_str)
+        ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
+        ticket = ticket_match.group(1) if ticket_match else ""
         session = sessions.get(ticket)
 
         print("📩 Received response from QB!")
-        LOG.info(
-            "receiveResponseXML from QB ticket=%s session_found=%s qbxml_len=%s",
-            (ticket[:8] + "…") if len(ticket) > 8 else ticket,
-            bool(session),
-            len(raw_qb or ""),
+        LOG.info("receiveResponseXML from QB")
+
+        # Parse response
+        response_match = re.search(
+            r'<strHCPResponse>(.*?)</strHCPResponse>', body_str, re.DOTALL
         )
+        if not response_match:
+            response_match = re.search(
+                r'<response>(.*?)</response>', body_str, re.DOTALL
+            )
 
-        raw = html.unescape(raw_qb) if raw_qb else ""
-
-        if session:
+        if response_match and session:
+            raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
 
             # ── Check status (QB uses attributes on *AddRs as well as child elements) ──
@@ -1871,12 +1809,7 @@ async def qbwc_handler(request: Request):
         else:
             progress = 100
             print("⚠️ Could not parse response or no session found")
-            LOG.warning(
-                "receiveResponseXML skipped: no session ticket=%s active_sessions=%s "
-                "(use a single worker if sessions are lost across processes)",
-                (ticket[:8] + "…") if len(ticket) > 8 else (ticket or "(empty)"),
-                len(sessions),
-            )
+            LOG.warning("Could not parse QB response or no session (ticket=%s)", ticket[:8] if ticket else "")
 
         xml = receive_response(progress)
 
@@ -1888,7 +1821,8 @@ async def qbwc_handler(request: Request):
 
     # ── closeConnection ────────────────────────────────────────
     elif soap_action == "closeConnection" or "closeConnection" in body_str:
-        ticket = _qbwc_extract_ticket(body_str)
+        ticket_match = re.search(r'<ticket>(.*?)</ticket>', body_str)
+        ticket = ticket_match.group(1) if ticket_match else ""
         sessions.pop(ticket, None)
         print("🔒 Session closed")
         LOG.info("Session closed")
