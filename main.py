@@ -109,9 +109,9 @@ def _qb_so_custom_field_name() -> str:
 
 QB_SO_CUSTOM_FIELD_NAME = _qb_so_custom_field_name()
 # What to send into that field: Magento increment_id (default) or entity_id.
-QB_ORDER_ID_SOURCE = (os.getenv("QB_ORDER_ID_SOURCE") or "increment").strip().lower()
+QB_ORDER_ID_SOURCE = (os.getenv("QB_ORDER_ID_SOURCE") or "entity").strip().lower()
 if QB_ORDER_ID_SOURCE not in ("increment", "entity"):
-    QB_ORDER_ID_SOURCE = "increment"
+    QB_ORDER_ID_SOURCE = "entity"
 
 
 @asynccontextmanager
