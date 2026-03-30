@@ -7,7 +7,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -95,150 +95,6 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
-# Magento value written to QB custom field and used for deduplication (increment vs entity).
-QB_ORDER_ID_SOURCE = (os.getenv("QB_ORDER_ID_SOURCE") or "entity").strip().lower()
-if QB_ORDER_ID_SOURCE not in ("increment", "entity"):
-    QB_ORDER_ID_SOURCE = "entity"
-
-
-def _qb_so_custom_field_name() -> str:
-    v = os.getenv("QB_SO_CUSTOM_FIELD_NAME")
-    if v is not None:
-        return v.strip()
-    v2 = os.getenv("QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME")
-    if v2 is not None:
-        return v2.strip()
-    return "Order Id"
-
-
-QB_SO_CUSTOM_FIELD_NAME = _qb_so_custom_field_name()
-QB_SO_CUSTOM_FIELD_ALIASES = [
-    x.strip()
-    for x in (os.getenv("QB_SO_CUSTOM_FIELD_ALIASES") or "").split(",")
-    if x.strip()
-]
-QB_SO_DEDUP_QUERY = os.getenv("QB_SO_DEDUP_QUERY", "1").strip().lower() in ("1", "true", "yes", "on")
-QB_ORDER_SYNC_STATE_FILE = (os.getenv("QB_ORDER_SYNC_STATE_FILE") or "logs/qb_order_sync_state.json").strip()
-QB_SO_QUERY_DATE_WINDOW_DAYS = max(1, min(3650, int(os.getenv("QB_SO_QUERY_DATE_WINDOW_DAYS", "90"))))
-QB_SO_QUERY_MAX_RETURNED = max(1, min(500, int(os.getenv("QB_SO_QUERY_MAX_RETURNED", "100"))))
-
-
-def _qb_so_field_names_for_match() -> List[str]:
-    names: List[str] = []
-    base = QB_SO_CUSTOM_FIELD_NAME
-    if base:
-        names.append(base)
-    names.extend(QB_SO_CUSTOM_FIELD_ALIASES)
-    if not names:
-        names.append("Order Id")
-    out: List[str] = []
-    for n in names:
-        if n not in out:
-            out.append(n)
-    return out
-
-
-def log_order_sync(
-    event: str,
-    *,
-    action: str,
-    magento_entity_id: Optional[str] = None,
-    magento_increment_id: Optional[str] = None,
-    order_id_qb: Optional[str] = None,
-    job_id: Optional[str] = None,
-    phase: Optional[str] = None,
-    qb_txn_id: Optional[str] = None,
-    message: Optional[str] = None,
-    level: str = "info",
-) -> None:
-    parts = [
-        f"event={event}",
-        f"action={action}",
-        f"magento_entity_id={magento_entity_id!r}",
-        f"magento_increment_id={magento_increment_id!r}",
-        f"order_id_qb={order_id_qb!r}",
-        f"job_id={job_id!r}",
-        f"phase={phase!r}",
-        f"qb_txn_id={qb_txn_id!r}",
-    ]
-    if message:
-        parts.append(f"detail={message!r}")
-    line = " | ".join(parts)
-    lg = getattr(LOG, level, LOG.info)
-    lg("order_sync %s", line)
-
-
-order_sync_store: Dict[str, Dict[str, str]] = {}
-
-
-def _order_sync_state_path() -> str:
-    p = QB_ORDER_SYNC_STATE_FILE
-    if not os.path.isabs(p):
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), p)
-    return p
-
-
-def load_order_sync_state() -> None:
-    global order_sync_store
-    path = _order_sync_state_path()
-    if not os.path.isfile(path):
-        LOG.info("Order sync state file not found (fresh): %s", path)
-        return
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, json.JSONDecodeError) as e:
-        LOG.warning("Could not load order sync state %s: %s", path, e)
-        return
-    orders = data.get("orders") if isinstance(data, dict) else None
-    if not isinstance(orders, dict):
-        return
-    order_sync_store = {}
-    for eid, rec in orders.items():
-        if not isinstance(rec, dict):
-            continue
-        tid = str(rec.get("qb_txn_id") or "").strip()
-        if not tid:
-            continue
-        kid = str(eid).strip()
-        order_sync_store[kid] = {
-            "qb_txn_id": tid,
-            "updated_at": str(rec.get("updated_at") or ""),
-        }
-        transaction_map[f"order:{kid}"] = tid
-    LOG.info(
-        "Loaded order sync state count=%s path=%s",
-        len(order_sync_store),
-        path,
-    )
-
-
-def save_order_sync_state() -> None:
-    path = _order_sync_state_path()
-    try:
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, mode=0o755, exist_ok=True)
-        payload = {"orders": dict(order_sync_store)}
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        os.replace(tmp, path)
-    except OSError as e:
-        LOG.error("Could not save order sync state %s: %s", path, e)
-
-
-def record_order_synced(magento_entity_id: str, qb_txn_id: str) -> None:
-    kid = str(magento_entity_id).strip()
-    tid = str(qb_txn_id).strip()
-    if not kid or not tid:
-        return
-    transaction_map[f"order:{kid}"] = tid
-    order_sync_store[kid] = {
-        "qb_txn_id": tid,
-        "updated_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-    }
-    save_order_sync_state()
 
 
 @asynccontextmanager
@@ -267,7 +123,6 @@ app = FastAPI(lifespan=_lifespan)
 
 sessions = {}          # { ticket: { client_id, jobs, index, total } }
 transaction_map = {}   # { "customer:email" : listID, "order:k365_id" : txnID }
-load_order_sync_state()
 last_inventory_pull: Optional[datetime] = None
 last_inventory_oms_summary: Optional[Dict[str, Any]] = None
 
@@ -614,11 +469,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
 
     entity_id = order.get("entity_id")
     increment_id = str(order.get("increment_id") or entity_id or "").strip()
-    entity_id_str = str(entity_id).strip() if entity_id is not None else ""
-    if QB_ORDER_ID_SOURCE == "entity":
-        order_id_qb = entity_id_str or increment_id
-    else:
-        order_id_qb = increment_id or entity_id_str
     po_number = _magento_order_po_number_only(order)
     txn_date = str(order.get("created_at") or "").strip()[:10]
 
@@ -662,7 +512,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "txn_date": txn_date,
         "po_number": po_number,
         "increment_id": increment_id,
-        "order_id_qb": order_id_qb,
         "lines": lines,
     }
     return payload, errors
@@ -810,19 +659,7 @@ async def sync_orders_from_oms(client_id: str) -> dict:
 
         if transaction_map.get(f"order:{kid}"):
             summary["skipped"] += 1
-            eid_s = str(entity_id).strip() if entity_id is not None else ""
-            inc_s = str(order.get("increment_id") or "").strip()
-            oqb = eid_s or inc_s if QB_ORDER_ID_SOURCE == "entity" else inc_s or eid_s
-            log_order_sync(
-                "enqueue",
-                action="skip_already_synced",
-                magento_entity_id=kid,
-                magento_increment_id=inc_s,
-                order_id_qb=oqb,
-                phase="enqueue",
-                qb_txn_id=transaction_map.get(f"order:{kid}"),
-                message="present in transaction_map or disk state",
-            )
+            LOG.debug("Skip enqueue: order %s already in transaction_map", kid)
             continue
         if _oms_order_job_pending_for(kid) or _oms_order_job_completed_for(kid):
             summary["skipped"] += 1
@@ -840,12 +677,6 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             )
             continue
 
-        oid_qb = str(payload.get("order_id_qb") or "").strip()
-        use_query = (
-            QB_SO_DEDUP_QUERY
-            and bool(QB_SO_CUSTOM_FIELD_NAME)
-            and bool(oid_qb)
-        )
         job = {
             "id": f"oms_order_{kid}",
             "client_id": client_id,
@@ -858,25 +689,12 @@ async def sync_orders_from_oms(client_id: str) -> dict:
             "retry_count": 0,
             "qb_id": None,
             "payload": payload,
-            "_qb_so_phase": "query" if use_query else "add",
         }
         job_queue.append(job)
         summary["enqueued"] += 1
-        log_order_sync(
-            "enqueue",
-            action="enqueued",
-            magento_entity_id=kid,
-            magento_increment_id=str(payload.get("increment_id") or ""),
-            order_id_qb=oid_qb,
-            job_id=job["id"],
-            phase=job["_qb_so_phase"],
-            message="push_order queued",
-        )
         LOG.info(
-            "Enqueued push_order from OMS order_id=%s order_id_qb=%s phase=%s po=%s customer=%s lines=%s",
+            "Enqueued push_order from OMS order_id=%s po=%s customer=%s lines=%s",
             kid,
-            oid_qb,
-            job["_qb_so_phase"],
             payload.get("po_number"),
             payload.get("customer_name"),
             len(payload.get("lines") or []),
@@ -1447,113 +1265,6 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
         f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
-
-def _txn_date_range_for_so_query(txn_date_str: str) -> Tuple[str, str]:
-    try:
-        base = datetime.strptime((txn_date_str or "")[:10], "%Y-%m-%d")
-    except ValueError:
-        base = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    w = QB_SO_QUERY_DATE_WINDOW_DAYS
-    d0 = base - timedelta(days=w)
-    d1 = base + timedelta(days=w)
-    return d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d")
-
-
-def build_sales_order_query_xml(payload: dict, request_id: str = "1") -> str:
-    rid = _qb_text_escape(request_id)
-    cust = _qb_text_escape(payload.get("customer_name", ""))
-    d0, d1 = _txn_date_range_for_so_query(str(payload.get("txn_date") or ""))
-    mx = QB_SO_QUERY_MAX_RETURNED
-    fields = _qb_so_field_names_for_match()
-    inc_els = "".join(f"<IncludeRetElement>{_qb_text_escape(f)}</IncludeRetElement>" for f in ("TxnID", "RefNumber", "DataExtRet"))
-    LOG.info(
-        "SalesOrderQueryRq customer=%r date_range=%s..%s max=%s field_names=%s",
-        payload.get("customer_name"),
-        d0,
-        d1,
-        mx,
-        fields,
-    )
-    return (
-        '<?xml version="1.0" ?><?qbxml version="13.0"?>'
-        '<QBXML><QBXMLMsgsRq onError="stopOnError">'
-        f'<SalesOrderQueryRq requestID="{rid}">'
-        f"<MaxReturned>{mx}</MaxReturned>"
-        "<ORTxnNoAccountQuery>"
-        "<TxnFilterNoAccount>"
-        "<EntityFilter>"
-        f"<FullName>{cust}</FullName>"
-        "</EntityFilter>"
-        "<TxnDateRangeFilter>"
-        f"<FromTxnDate>{d0}</FromTxnDate>"
-        f"<ToTxnDate>{d1}</ToTxnDate>"
-        "</TxnDateRangeFilter>"
-        "</TxnFilterNoAccount>"
-        "</ORTxnNoAccountQuery>"
-        f"{inc_els}"
-        "</SalesOrderQueryRq>"
-        "</QBXMLMsgsRq></QBXML>"
-    )
-
-
-def build_sales_order_dataext_xml(
-    txn_id: str,
-    data_ext_name: str,
-    value: str,
-    request_id: str = "1",
-) -> str:
-    rid = _qb_text_escape(request_id)
-    tid = _qb_text_escape(txn_id)
-    dname = _qb_text_escape(data_ext_name)
-    val = _qb_text_escape(value)
-    return (
-        '<?xml version="1.0" ?><?qbxml version="13.0"?>'
-        '<QBXML><QBXMLMsgsRq onError="stopOnError">'
-        f'<DataExtAddRq requestID="{rid}"><DataExtAdd>'
-        "<OwnerID>0</OwnerID>"
-        f"<DataExtName>{dname}</DataExtName>"
-        "<TxnDataExtType>SalesOrder</TxnDataExtType>"
-        f"<TxnID>{tid}</TxnID>"
-        f"<DataExtValue>{val}</DataExtValue>"
-        "</DataExtAdd></DataExtAddRq></QBXMLMsgsRq></QBXML>"
-    )
-
-
-def _norm_dataext_name(s: str) -> str:
-    return (s or "").strip().lower()
-
-
-def find_sales_order_txn_matching_order_id(
-    raw: str,
-    field_names: List[str],
-    order_id_qb: str,
-) -> Optional[str]:
-    want_val = str(order_id_qb).strip()
-    if not want_val:
-        return None
-    name_set = {_norm_dataext_name(n) for n in field_names if (n or "").strip()}
-    if not name_set:
-        name_set.add(_norm_dataext_name("Order Id"))
-    for block in re.findall(r"<SalesOrderRet>(.*?)</SalesOrderRet>", raw, re.DOTALL | re.IGNORECASE):
-        tid_m = re.search(r"<TxnID>(.*?)</TxnID>", block, re.IGNORECASE | re.DOTALL)
-        if not tid_m:
-            continue
-        txn_id = html.unescape(tid_m.group(1).strip())
-        for dext in re.findall(r"<DataExtRet>(.*?)</DataExtRet>", block, re.DOTALL | re.IGNORECASE):
-            nm = re.search(r"<DataExtName>(.*?)</DataExtName>", dext, re.IGNORECASE | re.DOTALL)
-            val = re.search(r"<DataExtValue>(.*?)</DataExtValue>", dext, re.IGNORECASE | re.DOTALL)
-            if not nm or not val:
-                continue
-            nms = html.unescape(nm.group(1).strip())
-            vvs = html.unescape(val.group(1).strip())
-            if _norm_dataext_name(nms) not in name_set:
-                continue
-            if vvs.strip() != want_val:
-                continue
-            return txn_id
-    return None
-
-
 def build_inventory_xml(request_id: str = "1") -> str:
     return f"""<?xml version="1.0" ?><?qbxml version="13.0"?><QBXML><QBXMLMsgsRq onError="stopOnError"><ItemInventoryQueryRq requestID="{request_id}"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryQueryRq><ItemInventoryAssemblyQueryRq requestID="{request_id}_asm"><ActiveStatus>ActiveOnly</ActiveStatus></ItemInventoryAssemblyQueryRq></QBXMLMsgsRq></QBXML>"""
 
@@ -1860,57 +1571,16 @@ async def qbwc_handler(request: Request):
                 LOG.info("Pushing customer name=%s k365_id=%s", job["payload"].get("name"), job.get("k365_id"))
 
             elif job["operation"] == "push_order":
-                so_phase = job.get("_qb_so_phase") or "add"
-                pl = job["payload"]
-                oid_qb = str(pl.get("order_id_qb") or "").strip()
-                fname = QB_SO_CUSTOM_FIELD_NAME
-                if so_phase == "query":
-                    qbxml = build_sales_order_query_xml(pl, request_id=job["id"])
-                    print(f"🔎 QB pre-check SalesOrder query order_id_qb={oid_qb!r} customer={pl.get('customer_name')!r}")
-                    log_order_sync(
-                        "qbwc_send",
-                        action="qb_precheck_query",
-                        magento_entity_id=str(job.get("k365_id")),
-                        magento_increment_id=str(pl.get("increment_id") or ""),
-                        order_id_qb=oid_qb,
-                        job_id=job["id"],
-                        phase="query",
-                    )
-                elif so_phase == "dataext":
-                    txn = job.get("_qb_txn_id") or ""
-                    qbxml = build_sales_order_dataext_xml(txn, fname, oid_qb, request_id=job["id"])
-                    print(f"🛒 Order DataExt {fname!r} ← {oid_qb!r}")
-                    log_order_sync(
-                        "qbwc_send",
-                        action="set_dataext",
-                        magento_entity_id=str(job.get("k365_id")),
-                        magento_increment_id=str(pl.get("increment_id") or ""),
-                        order_id_qb=oid_qb,
-                        job_id=job["id"],
-                        phase="dataext",
-                        qb_txn_id=txn[:24] if txn else None,
-                    )
-                else:
-                    qbxml = build_order_xml(pl, request_id=job["id"])
-                    print(f"🛒 Pushing order: {pl.get('po_number')}")
-                    log_order_sync(
-                        "qbwc_send",
-                        action="create_so",
-                        magento_entity_id=str(job.get("k365_id")),
-                        magento_increment_id=str(pl.get("increment_id") or ""),
-                        order_id_qb=oid_qb,
-                        job_id=job["id"],
-                        phase="add",
-                    )
-                    LOG.info(
-                        "Pushing order job=%s order_id=%s order_id_qb=%s po=%s customer=%s lines=%s",
-                        job["id"],
-                        job.get("k365_id"),
-                        oid_qb,
-                        pl.get("po_number"),
-                        pl.get("customer_name"),
-                        len(pl.get("lines") or []),
-                    )
+                qbxml = build_order_xml(job["payload"], request_id=job["id"])
+                print(f"🛒 Pushing order: {job['payload']['po_number']}")
+                LOG.info(
+                    "Pushing order job=%s order_id=%s po=%s customer=%s lines=%s",
+                    job["id"],
+                    job.get("k365_id"),
+                    job["payload"].get("po_number"),
+                    job["payload"].get("customer_name"),
+                    len(job["payload"].get("lines") or []),
+                )
 
             elif job["operation"] == "pull_inventory":
                 qbxml = build_inventory_xml(request_id=job["id"])
@@ -1945,19 +1615,12 @@ async def qbwc_handler(request: Request):
         if response_match and session:
             raw = html.unescape(response_match.group(1))
             job = session["jobs"][session["index"]]
-            advance_session = True
 
             # ── Check status (QB uses attributes on *AddRs as well as child elements) ──
             if job["operation"] == "push_customer":
                 rs_hint = ["CustomerAddRs"]
             elif job["operation"] == "push_order":
-                so_phase = job.get("_qb_so_phase") or "add"
-                if so_phase == "query":
-                    rs_hint = ["SalesOrderQueryRs"]
-                elif so_phase == "dataext":
-                    rs_hint = ["DataExtAddRs"]
-                else:
-                    rs_hint = ["SalesOrderAddRs"]
+                rs_hint = ["SalesOrderAddRs"]
             elif job["operation"] == "pull_inventory":
                 rs_hint = ["ItemInventoryQueryRs"]
             else:
@@ -1998,192 +1661,41 @@ async def qbwc_handler(request: Request):
                     update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "push_order":
-                so_phase = job.get("_qb_so_phase") or "add"
-                pl = job["payload"]
-                oid_qb = str(pl.get("order_id_qb") or "").strip()
-                fname = QB_SO_CUSTOM_FIELD_NAME
+                txn_id  = re.search(r'<TxnID>(.*?)</TxnID>', raw)
+                ref_num = re.search(r'<RefNumber>(.*?)</RefNumber>', raw)
 
-                if so_phase == "query":
-                    if code != "0":
-                        print(f"❌ SalesOrderQuery failed: {msg or code}")
-                        log_order_sync(
-                            "qbwc_recv",
-                            action="error",
-                            magento_entity_id=str(job.get("k365_id")),
-                            magento_increment_id=str(pl.get("increment_id") or ""),
-                            order_id_qb=oid_qb,
-                            job_id=job["id"],
-                            phase="query",
-                            message=msg or f"code={code}",
-                            level="error",
-                        )
-                        retry = job["retry_count"] + 1
-                        update_job(
-                            job["id"],
-                            status="dead" if retry >= 3 else "failed",
-                            retry_count=retry,
-                        )
-                    else:
-                        match_txn = find_sales_order_txn_matching_order_id(
-                            raw,
-                            _qb_so_field_names_for_match(),
-                            oid_qb,
-                        )
-                        if match_txn:
-                            record_order_synced(str(job["k365_id"]), match_txn)
-                            update_job(job["id"], status="completed", qb_id=match_txn)
-                            print(
-                                f"⏭️  Order already in QuickBooks (ORDER ID={oid_qb!r}) TxnID={match_txn} — skip create"
-                            )
-                            log_order_sync(
-                                "qbwc_recv",
-                                action="skip_qb_match",
-                                magento_entity_id=str(job.get("k365_id")),
-                                magento_increment_id=str(pl.get("increment_id") or ""),
-                                order_id_qb=oid_qb,
-                                job_id=job["id"],
-                                phase="query",
-                                qb_txn_id=match_txn,
-                                message="DataExt match on existing SalesOrder",
-                            )
-                        else:
-                            job["_qb_so_phase"] = "add"
-                            advance_session = False
-                            update_job(job["id"], status="processing")
-                            print(f"🔎 No existing SO with ORDER ID={oid_qb!r} — creating Sales Order")
-                            log_order_sync(
-                                "qbwc_recv",
-                                action="proceed_create",
-                                magento_entity_id=str(job.get("k365_id")),
-                                magento_increment_id=str(pl.get("increment_id") or ""),
-                                order_id_qb=oid_qb,
-                                job_id=job["id"],
-                                phase="query",
-                                message="no DataExt match in date window",
-                            )
-                elif so_phase == "dataext":
-                    qb_txn_id = job.get("_qb_txn_id")
-                    if code == "0" and qb_txn_id:
-                        job.pop("_qb_so_phase", None)
-                        job.pop("_qb_txn_id", None)
-                        record_order_synced(str(job["k365_id"]), qb_txn_id)
-                        update_job(job["id"], status="completed", qb_id=qb_txn_id)
-                        print("✅ Sales Order custom field saved in QuickBooks")
-                        log_order_sync(
-                            "qbwc_recv",
-                            action="set_dataext",
-                            magento_entity_id=str(job.get("k365_id")),
-                            magento_increment_id=str(pl.get("increment_id") or ""),
-                            order_id_qb=oid_qb,
-                            job_id=job["id"],
-                            phase="dataext",
-                            qb_txn_id=qb_txn_id,
-                        )
-                    else:
-                        print(f"❌ DataExtAdd failed: {msg or code}")
-                        log_order_sync(
-                            "qbwc_recv",
-                            action="error",
-                            magento_entity_id=str(job.get("k365_id")),
-                            magento_increment_id=str(pl.get("increment_id") or ""),
-                            order_id_qb=oid_qb,
-                            job_id=job["id"],
-                            phase="dataext",
-                            qb_txn_id=qb_txn_id,
-                            message=msg or f"code={code}",
-                            level="error",
-                        )
-                        if qb_txn_id:
-                            job.pop("_qb_so_phase", None)
-                            job.pop("_qb_txn_id", None)
-                            record_order_synced(str(job["k365_id"]), qb_txn_id)
-                            update_job(job["id"], status="completed", qb_id=qb_txn_id)
-                            LOG.warning(
-                                "DataExt failed but SO exists; marked completed job=%s to avoid duplicate SO",
-                                job["id"],
-                            )
+                if txn_id:
+                    qb_txn_id = txn_id.group(1)
+                    update_job(job["id"], status="completed", qb_id=qb_txn_id)
+                    transaction_map[f"order:{job['k365_id']}"] = qb_txn_id
+                    print(f"✅ Order created! TxnID: {qb_txn_id}")
+                    print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
+                    LOG.info("Order created TxnID=%s RefNumber=%s", qb_txn_id, ref_num.group(1) if ref_num else "N/A")
                 else:
-                    txn_id = re.search(r"<TxnID>(.*?)</TxnID>", raw)
-                    ref_num = re.search(r"<RefNumber>(.*?)</RefNumber>", raw)
-
-                    if txn_id:
-                        qb_txn_id = txn_id.group(1)
-                        if fname and oid_qb:
-                            job["_qb_so_phase"] = "dataext"
-                            job["_qb_txn_id"] = qb_txn_id
-                            advance_session = False
-                            update_job(job["id"], status="processing", qb_id=qb_txn_id)
-                            print(f"✅ Order created! TxnID: {qb_txn_id}")
-                            print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
-                            print(f"➡️  Setting custom field {fname!r} = {oid_qb!r}")
-                            log_order_sync(
-                                "qbwc_recv",
-                                action="create_so",
-                                magento_entity_id=str(job.get("k365_id")),
-                                magento_increment_id=str(pl.get("increment_id") or ""),
-                                order_id_qb=oid_qb,
-                                job_id=job["id"],
-                                phase="add",
-                                qb_txn_id=qb_txn_id,
-                                message="queued DataExt",
-                            )
-                        else:
-                            record_order_synced(str(job["k365_id"]), qb_txn_id)
-                            update_job(job["id"], status="completed", qb_id=qb_txn_id)
-                            print(f"✅ Order created! TxnID: {qb_txn_id}")
-                            print(f"📝 RefNumber: {ref_num.group(1) if ref_num else 'N/A'}")
-                            log_order_sync(
-                                "qbwc_recv",
-                                action="create_so",
-                                magento_entity_id=str(job.get("k365_id")),
-                                magento_increment_id=str(pl.get("increment_id") or ""),
-                                order_id_qb=oid_qb,
-                                job_id=job["id"],
-                                phase="add",
-                                qb_txn_id=qb_txn_id,
-                                message="no custom field configured",
-                            )
-                            LOG.info(
-                                "Order created TxnID=%s RefNumber=%s (no QB custom field or order_id_qb)",
-                                qb_txn_id,
-                                ref_num.group(1) if ref_num else "N/A",
-                            )
-                    else:
-                        print(f"❌ Order push failed: {msg or '(no statusMessage — see log for QB XML)'}")
-                        log_order_sync(
-                            "qbwc_recv",
-                            action="error",
-                            magento_entity_id=str(job.get("k365_id")),
-                            magento_increment_id=str(pl.get("increment_id") or ""),
-                            order_id_qb=oid_qb,
-                            job_id=job["id"],
-                            phase="add",
-                            message=msg,
-                            level="error",
-                        )
-                        LOG.error(
-                            "Order push failed job=%s order_id=%s increment_id=%s po=%r customer=%r "
-                            "qb_code=%s qb_severity=%s message=%r | CustomerRef FullName must match an "
-                            "existing QuickBooks customer exactly (create customer in QB or sync customers first). "
-                            "Line items must exist as QB products (ItemRef FullName).",
-                            job["id"],
-                            job.get("k365_id"),
-                            job["payload"].get("increment_id"),
-                            job["payload"].get("po_number"),
-                            job["payload"].get("customer_name"),
-                            code,
-                            sev,
-                            msg,
-                        )
-                        LOG.error(
-                            "Order push QB XML (truncated) job=%s len=%s raw=%s",
-                            job["id"],
-                            len(raw),
-                            (raw.replace("\n", " ").replace("\r", ""))[:4000],
-                        )
-                        retry = job["retry_count"] + 1
-                        new_status = "dead" if retry >= 3 else "failed"
-                        update_job(job["id"], status=new_status, retry_count=retry)
+                    print(f"❌ Order push failed: {msg or '(no statusMessage — see log for QB XML)'}")
+                    LOG.error(
+                        "Order push failed job=%s order_id=%s increment_id=%s po=%r customer=%r "
+                        "qb_code=%s qb_severity=%s message=%r | CustomerRef FullName must match an "
+                        "existing QuickBooks customer exactly (create customer in QB or sync customers first). "
+                        "Line items must exist as QB products (ItemRef FullName).",
+                        job["id"],
+                        job.get("k365_id"),
+                        job["payload"].get("increment_id"),
+                        job["payload"].get("po_number"),
+                        job["payload"].get("customer_name"),
+                        code,
+                        sev,
+                        msg,
+                    )
+                    LOG.error(
+                        "Order push QB XML (truncated) job=%s len=%s raw=%s",
+                        job["id"],
+                        len(raw),
+                        (raw.replace("\n", " ").replace("\r", ""))[:4000],
+                    )
+                    retry = job["retry_count"] + 1
+                    new_status = "dead" if retry >= 3 else "failed"
+                    update_job(job["id"], status=new_status, retry_count=retry)
 
             elif job["operation"] == "pull_inventory":
                 global last_inventory_pull, last_inventory_oms_summary
@@ -2267,8 +1779,7 @@ async def qbwc_handler(request: Request):
                 update_job(job["id"], status="completed")
 
             # ── Advance session index ─────────────────────────
-            if advance_session:
-                session["index"] += 1
+            session["index"] += 1
             remaining = session["total"] - session["index"]
 
             if remaining > 0:
