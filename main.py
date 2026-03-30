@@ -9,7 +9,6 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape as xml_escape
@@ -23,10 +22,7 @@ except ImportError:
         # Keep app booting even if python-dotenv is not installed in runtime.
         return False
 
-# Load .env from this package directory so QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME etc. apply even
-# when the process cwd is not the qb-connector folder (uvicorn/gunicorn/systemd).
-_DOTENV_PATH = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=_DOTENV_PATH)
+load_dotenv()
 
 # ── Logging (console + rotating file) ────────────────────────────────────────
 LOG = logging.getLogger("qb_connector")
@@ -99,32 +95,16 @@ OMS_INVENTORY_PUSH_ENABLED = os.getenv("OMS_INVENTORY_PUSH_ENABLED", "1").strip(
     "yes",
     "on",
 )
-def _qb_sales_order_order_id_dataext_name() -> str:
-    """
-    QBXML DataExtName for Magento entity_id on Sales Order. Must match QuickBooks exactly.
-    Reads env at call time; supports QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME or QB_ORDER_ID_DATAEXT_NAME.
-    """
-    raw = (
-        os.getenv("QB_SALES_ORDER_ORDER_ID_DATAEXT_NAME")
-        or os.getenv("QB_ORDER_ID_DATAEXT_NAME")
-        or "Order Id"
-    ).strip()
-    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ('"', "'"):
-        raw = raw[1:-1].strip()
-    return raw
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     print("🚀 QB Connector starting…")
     LOG.info(
-        "QB Connector starting | OMS configured=%s | sync_on_auth=%s | qbwc_job_batch=%s | "
-        "env_file=%s | qb_order_id_dataext_name=%r",
+        "QB Connector starting | OMS configured=%s | sync_on_auth=%s | qbwc_job_batch=%s",
         bool(OMS_BASE_URL and OMS_ACCESS_TOKEN),
         OMS_SYNC_ON_AUTH,
         QBWC_JOB_BATCH_SIZE,
-        str(_DOTENV_PATH) if _DOTENV_PATH.is_file() else "(missing)",
-        _qb_sales_order_order_id_dataext_name(),
     )
     yield
     print("🛑 QB Connector shutting down")
@@ -532,7 +512,6 @@ def magento_order_to_payload(order: dict) -> Tuple[dict, List[str]]:
         "txn_date": txn_date,
         "po_number": po_number,
         "increment_id": increment_id,
-        "entity_id": str(entity_id).strip() if entity_id is not None else "",
         "lines": lines,
     }
     return payload, errors
@@ -1277,23 +1256,13 @@ def build_order_xml(payload: dict, request_id: str = "1") -> str:
     customer_name = _qb_text_escape(payload.get("customer_name", ""))
     txn_date = _qb_text_escape(payload.get("txn_date", ""))
     po_number = _qb_text_escape(payload.get("po_number", ""))
-    order_id_xml = ""
-    entity_id_str = str(payload.get("entity_id") or "").strip()
-    ext_label = _qb_sales_order_order_id_dataext_name()
-    if entity_id_str and ext_label:
-        ext_name = _qb_text_escape(ext_label)
-        ext_val = _qb_text_escape(entity_id_str)
-        order_id_xml = (
-            f"<DataExt><DataExtName>{ext_name}</DataExtName>"
-            f"<DataExtValue>{ext_val}</DataExtValue></DataExt>"
-        )
     return (
         '<?xml version="1.0" ?><?qbxml version="13.0"?>'
         '<QBXML><QBXMLMsgsRq onError="stopOnError">'
         f'<SalesOrderAddRq requestID="{rid}"><SalesOrderAdd>'
         f"<CustomerRef><FullName>{customer_name}</FullName></CustomerRef>"
         f"<TxnDate>{txn_date}</TxnDate><PONumber>{po_number}</PONumber>"
-        f"{order_id_xml}{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
+        f"{lines_xml}</SalesOrderAdd></SalesOrderAddRq></QBXMLMsgsRq></QBXML>"
     )
 
 def build_inventory_xml(request_id: str = "1") -> str:
